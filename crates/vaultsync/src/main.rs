@@ -86,6 +86,10 @@ enum Cmd {
         /// network (tests, offline use).
         #[arg(long, hide = true)]
         addr_dir: Option<PathBuf>,
+        /// Look for changes every 2 s instead of using the OS's file
+        /// notifications (used anyway when those are unavailable).
+        #[arg(long)]
+        poll: bool,
     },
 }
 
@@ -137,11 +141,16 @@ fn main() -> Result<()> {
         Cmd::Rollback { commit, path } => {
             println!("committed {}", open()?.rollback(&commit, path.as_deref())?)
         }
-        Cmd::Run { catch_up, addr_dir } => daemon::run(
+        Cmd::Run {
+            catch_up,
+            addr_dir,
+            poll,
+        } => daemon::run(
             open()?,
             daemon::Opts {
                 catch_up: Duration::from_secs(catch_up),
                 addr_dir,
+                poll,
             },
         )?,
     }
