@@ -31,6 +31,8 @@ impl Git {
                 cmd.env_remove(var);
             }
         }
+        // Paths are file names, never globs: `[draft].md` matches only itself.
+        cmd.env("GIT_LITERAL_PATHSPECS", "1");
         cmd
     }
 
