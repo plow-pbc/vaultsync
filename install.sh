@@ -88,7 +88,8 @@ say "Installed $("$BIN" --version) at $BIN"
 # service already runs.
 if [ -n "$code" ]; then
     out=$("$BIN" join "$code" ${folder:+--folder "$folder"} ${machine:+--machine "$machine"})
-    echo "$out"
+    # Drop join's "start syncing with vaultsync run" hint: the service does that.
+    echo "$out" | sed 's/^Joined\. .*/Joined./'
     folder=$(echo "$out" | sed -n 's/^vault: *//p')
 elif [ -n "$init" ]; then
     out=$("$BIN" init "$init" ${machine:+--machine "$machine"})
