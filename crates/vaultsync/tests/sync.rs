@@ -438,3 +438,106 @@ fn heads_holding_the_same_edits_settle_without_merging_again() {
         "made a new merge {settled} instead of settling on one of {heads:?}"
     );
 }
+
+#[test]
+fn a_fresh_root_slipped_in_under_an_exact_merge_is_refused() {
+    let mut mesh = Mesh::new(2);
+    // m1's history gains an unsigned root with a file, joined to the real
+    // history by exactly the merge vaultsync itself would make.
+    let b = &mesh.nodes[1];
+    let gd = format!("--git-dir={}.git", b.folder.display());
+    let gdir = b.folder.with_extension("git");
+    let blob = git_in(&gdir, &["hash-object", "-w", "--stdin"], "smuggled\n");
+    let tree = git_in(
+        &gdir,
+        &["mktree"],
+        &format!("100644 blob {}\tsmuggled.md\n", blob.trim()),
+    );
+    let root = git(
+        &b.folder,
+        &[&gd, "commit-tree", tree.trim(), "-m", "fresh start"],
+    );
+    let head = git(&b.folder, &[&gd, "rev-parse", "HEAD"]);
+    let (mut ours, mut theirs) = (head.trim().to_owned(), root.trim().to_owned());
+    if theirs < ours {
+        std::mem::swap(&mut ours, &mut theirs);
+    }
+    let merged = git(
+        &b.folder,
+        &[
+            &gd,
+            "merge-tree",
+            "--write-tree",
+            "--allow-unrelated-histories",
+            &ours[..12],
+            &theirs[..12],
+        ],
+    );
+    let time = git(
+        &b.folder,
+        &[&gd, "log", "--no-walk", "--format=%ct", &ours, &theirs],
+    )
+    .lines()
+    .map(|t| t.parse::<u64>().unwrap())
+    .max()
+    .unwrap();
+    let date = format!("{time} +0000");
+    let out = Command::new("git")
+        .args([
+            &gd,
+            "-c",
+            "commit.gpgsign=false",
+            "commit-tree",
+            merged.lines().next().unwrap(),
+            "-p",
+            &ours,
+            "-p",
+            &theirs,
+            "-m",
+            "Merge",
+        ])
+        .envs([
+            ("GIT_AUTHOR_NAME", "vault-sync"),
+            ("GIT_AUTHOR_EMAIL", "vault-sync"),
+            ("GIT_AUTHOR_DATE", date.as_str()),
+        ])
+        .envs([
+            ("GIT_COMMITTER_NAME", "vault-sync"),
+            ("GIT_COMMITTER_EMAIL", "vault-sync"),
+            ("GIT_COMMITTER_DATE", date.as_str()),
+        ])
+        .output()
+        .unwrap();
+    let merge = String::from_utf8(out.stdout).unwrap();
+    let wt = format!("--work-tree={}", b.folder.display());
+    git(&b.folder, &[&gd, "update-ref", "HEAD", merge.trim()]);
+    git(&b.folder, &[&gd, &wt, "read-tree", "-u", "--reset", "HEAD"]);
+
+    mesh.start_all();
+    let refused = format!("refusing history from {}", &mesh.nodes[1].id[..10]);
+    assert!(
+        wait_until(15, || mesh.nodes[0].log_text().contains(&refused)),
+        "{}",
+        mesh.logs()
+    );
+    assert_eq!(mesh.nodes[0].read("smuggled.md"), None);
+}
+
+/// Plain git with `input` on stdin.
+fn git_in(git_dir: &std::path::Path, args: &[&str], input: &str) -> String {
+    use std::io::Write;
+    let mut child = Command::new("git")
+        .arg(format!("--git-dir={}", git_dir.display()))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap()
+}

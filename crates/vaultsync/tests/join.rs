@@ -213,3 +213,118 @@ fn a_removal_wins_over_a_concurrent_member_change() {
         "{members}"
     );
 }
+
+#[test]
+fn join_never_touches_history_reached_through_a_symlink() {
+    // m0's folder is empty, but its history sits beside it.
+    let mesh = Mesh::new(1);
+    let m0 = &mesh.nodes[0];
+    let head = m0.head();
+    let alias = mesh._tmp.path().join("alias");
+    std::os::unix::fs::symlink(&m0.folder, &alias).unwrap();
+    let code = m0.invite(600);
+
+    let out = vaultsync(
+        mesh._tmp.path(),
+        &["join", &code, "--folder", alias.to_str().unwrap()],
+    );
+
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("already has files or history"));
+    assert_eq!(m0.head(), head, "m0's history must be untouched");
+}
+
+#[test]
+fn rollback_never_changes_the_member_list() {
+    let mesh = Mesh::new(1);
+    let m0 = &mesh.nodes[0];
+    let start = ok(&m0.folder, &["log"])
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let gone = Node::new(mesh._tmp.path(), "gone");
+    m0.write("notes.md", "later\n");
+    m0.trust(&gone);
+    ok(&m0.folder, &["remove", "gone"]);
+
+    // Back to before gone was ever added: the notes go, the tombstone stays.
+    ok(&m0.folder, &["rollback", &start]);
+    assert_eq!(m0.read("notes.md"), None);
+    let members = m0.read(".vault/members").unwrap();
+    assert!(
+        members.contains(&format!("removed {} gone", gone.id)),
+        "{members}"
+    );
+
+    let direct = vaultsync(&m0.folder, &["rollback", &start, ".vault/members"]);
+    assert!(!direct.status.success());
+    assert!(String::from_utf8_lossy(&direct.stderr).contains("member add"));
+}
+
+#[test]
+fn a_fetch_that_began_before_a_removal_gets_nothing_after_it() {
+    let mut mesh = Mesh::new(2);
+    let addrs = mesh.addrs.clone();
+    mesh.nodes[0].start_with(&addrs, Some("pause-before-bundle"));
+    mesh.start(1);
+    mesh.converged(AFTER_RESTART);
+    // The moment one of m1's fetches is held mid-request, remove m1 and write.
+    let pauses = || {
+        mesh.nodes[0]
+            .log_text()
+            .matches("pausing before the bundle")
+            .count()
+    };
+    let seen = pauses();
+    assert!(wait_until(15, || pauses() > seen), "{}", mesh.logs());
+    ok(&mesh.nodes[0].folder, &["remove", "m1"]);
+    mesh.nodes[0].write("secret.md", "after m1 was removed\n");
+
+    std::thread::sleep(Duration::from_secs(8));
+    assert_eq!(mesh.nodes[1].read("secret.md"), None, "{}", mesh.logs());
+    assert!(
+        mesh.nodes[0].log_text().contains("is no longer a member"),
+        "{}",
+        mesh.logs()
+    );
+}
+
+#[test]
+fn a_failed_join_keeps_files_it_did_not_write() {
+    let mut mesh = Mesh::new(1);
+    let addrs = mesh.addrs.clone();
+    mesh.nodes[0].start_with(&addrs, Some("stall-serving"));
+    let code = mesh.nodes[0].invite(600);
+    let folder = mesh._tmp.path().join("newcomer");
+    let mut join = std::process::Command::new(env!("CARGO_BIN_EXE_vaultsync"))
+        .args([
+            "join",
+            &code,
+            "--folder",
+            folder.to_str().unwrap(),
+            "--addr-dir",
+            addrs.to_str().unwrap(),
+        ])
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // While the join waits on the inviter, an editor saves into the folder.
+    assert!(wait_until(10, || folder.with_extension("git").exists()));
+    fs::write(folder.join("typed-meanwhile.md"), "keep me\n").unwrap();
+    mesh.nodes[0].stop();
+
+    assert!(
+        wait_until(90, || join.try_wait().unwrap().is_some()),
+        "join never gave up"
+    );
+    assert!(!join.wait().unwrap().success());
+    assert_eq!(
+        fs::read_to_string(folder.join("typed-meanwhile.md")).unwrap(),
+        "keep me\n"
+    );
+    assert!(
+        !folder.with_extension("git").exists(),
+        "join's own history is cleaned up"
+    );
+}
