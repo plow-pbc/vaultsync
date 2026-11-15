@@ -60,6 +60,16 @@ fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+fn start_daemon(folder: &Path) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_vaultsync"))
+        .arg("--vault")
+        .arg(folder)
+        .arg("run")
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
 fn git_dir(folder: &Path) -> PathBuf {
     PathBuf::from(format!("{}.git", folder.display()))
 }
@@ -160,16 +170,89 @@ fn init_adopts_existing_history_unchanged() {
 }
 
 #[test]
-fn init_refuses_folder_with_history_in_two_places() {
+fn init_refuses_unusable_history_and_moves_nothing() {
+    for case in ["history in two places", "detached HEAD"] {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("notes");
+        existing_repo(&folder);
+        if case == "history in two places" {
+            fs::create_dir(git_dir(&folder)).unwrap();
+        } else {
+            git(&folder, &["checkout", "-q", "--detach"]);
+        }
+
+        let out = vaultsync(tmp.path(), &["init", folder.to_str().unwrap()]);
+
+        assert!(!out.status.success(), "{case}");
+        assert!(folder.join(".git").is_dir(), "{case}: nothing may be moved");
+        if case == "detached HEAD" {
+            assert!(!git_dir(&folder).exists(), "{case}");
+        }
+    }
+}
+
+#[test]
+fn failed_auto_commit_is_retried_without_another_edit() {
     let tmp = tempfile::tempdir().unwrap();
     let folder = tmp.path().join("notes");
-    existing_repo(&folder);
-    fs::create_dir(git_dir(&folder)).unwrap();
+    init(&folder);
+    let mut daemon = start_daemon(&folder);
+    let mut stderr = BufReader::new(daemon.stderr.take().unwrap());
 
-    let out = vaultsync(tmp.path(), &["init", folder.to_str().unwrap()]);
+    // Another git process holds the index, so the commit fails.
+    let index_lock = git_dir(&folder).join("index.lock");
+    fs::write(&index_lock, "").unwrap();
+    fs::write(folder.join("held.md"), "saved while git was busy\n").unwrap();
+    let mut line = String::new();
+    while !line.contains("commit failed") {
+        line.clear();
+        assert_ne!(stderr.read_line(&mut line).unwrap(), 0, "daemon exited");
+    }
+    fs::remove_file(&index_lock).unwrap();
 
-    assert!(!out.status.success());
-    assert!(folder.join(".git").is_dir(), "nothing may be moved");
+    let start = Instant::now();
+    while !ok(&folder, &["log", "-n", "1"]).contains("Update held.md") {
+        assert!(start.elapsed() < Duration::from_secs(10), "never retried");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+}
+
+#[test]
+fn rollback_never_overwrites_a_file_it_does_not_track() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("notes");
+    fs::create_dir(&folder).unwrap();
+    fs::write(folder.join("draft.tmp"), "old tracked draft\n").unwrap();
+    init(&folder);
+    let first = ok(&folder, &["log"])
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    // Later the draft is untracked and ignored, and someone keeps a local copy.
+    let (gd, wt) = (
+        format!("--git-dir={}", git_dir(&folder).display()),
+        format!("--work-tree={}", folder.display()),
+    );
+    fs::write(folder.join(".gitignore"), "*.tmp\n").unwrap();
+    git(&folder, &[&gd, &wt, "rm", "-q", "--cached", "draft.tmp"]);
+    git(&folder, &[&gd, &wt, "add", ".gitignore"]);
+    git(&folder, &[&gd, &wt, "commit", "-qm", "ignore drafts"]);
+    fs::write(folder.join("draft.tmp"), "local scratch\n").unwrap();
+
+    let out = vaultsync(&folder, &["rollback", &first]);
+
+    assert!(!out.status.success(), "rollback must refuse");
+    assert_eq!(
+        fs::read_to_string(folder.join("draft.tmp")).unwrap(),
+        "local scratch\n"
+    );
+    assert!(
+        folder.join(".gitignore").exists(),
+        "nothing restored halfway"
+    );
 }
 
 #[test]
@@ -177,13 +260,7 @@ fn edit_becomes_commit_within_seconds() {
     let tmp = tempfile::tempdir().unwrap();
     let folder = tmp.path().join("notes");
     init(&folder);
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_vaultsync"))
-        .arg("--vault")
-        .arg(&folder)
-        .arg("run")
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut daemon = start_daemon(&folder);
     let mut stderr = BufReader::new(daemon.stderr.take().unwrap());
     let mut line = String::new();
     stderr.read_line(&mut line).unwrap();
@@ -224,7 +301,7 @@ fn rollback_restores_prior_version_as_new_commit() {
     fs::write(folder.join("b.md"), "b\n").unwrap();
 
     // One file: the pending edit is committed first, then a.md goes back to v1.
-    let out = ok(&folder, &["rollback", &first, "a.md"]);
+    let out = ok(&folder, &["rollback", "HEAD", "a.md"]);
     assert_eq!(fs::read_to_string(folder.join("a.md")).unwrap(), "v1\n");
     assert!(folder.join("b.md").exists());
     let log = ok(&folder, &["log"]);

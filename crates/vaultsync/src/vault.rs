@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -45,6 +45,15 @@ impl Vault {
         let vault = Vault::at(folder.canonicalize()?);
         let inner = vault.folder().join(".git");
         let beside = &vault.git.git_dir;
+        // Check existing history before moving anything.
+        for git_dir in [&inner, beside].into_iter().filter(|d| d.is_dir()) {
+            let git = Git {
+                git_dir: git_dir.clone(),
+                work_tree: vault.folder().to_owned(),
+            };
+            git.run(["symbolic-ref", "-q", "HEAD"])
+                .with_context(|| format!("HEAD in {} must be on a branch", git_dir.display()))?;
+        }
         match (fs::symlink_metadata(&inner).ok(), beside.exists()) {
             (Some(meta), false) if meta.is_dir() => {
                 fs::rename(&inner, beside).context("moving .git beside the folder")?
@@ -67,10 +76,6 @@ impl Vault {
         if !fresh && !beside.join("index").exists() {
             vault.git.run(["read-tree", "HEAD"])?;
         }
-        vault
-            .git
-            .run(["symbolic-ref", "-q", "HEAD"])
-            .context("HEAD must be on a branch")?;
         let machine = match machine {
             Some(m) => m,
             None => gethostname::gethostname().to_string_lossy().into_owned(),
@@ -115,9 +120,7 @@ impl Vault {
         if let Ok(agent) = std::env::var("VAULTSYNC_AGENT") {
             message.push_str(&format!("\n\nAgent: {agent}"));
         }
-        let mut cmd = self
-            .git
-            .command(["commit", "-q", "--no-verify", "-m", &message]);
+        let mut cmd = self.git.command(["commit", "-q", "-m", &message]);
         if allow_empty {
             cmd.arg("--allow-empty");
         }
@@ -178,17 +181,51 @@ impl Vault {
     /// commit. Pending edits are committed first, so nothing is lost.
     pub fn rollback(&self, rev: &str, path: Option<&Path>) -> Result<String> {
         let _lock = self.lock()?;
-        self.commit_pending_locked()?;
+        // Resolve first: the checkpoint below moves HEAD, and with it `HEAD~1`.
         let id = self
             .git
             .value(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])?;
         let short = self.git.value(["rev-parse", "--short", &id])?;
+        self.commit_pending_locked()?;
+        // Git overwrites ignored files freely; refuse instead.
+        let mut added = self.git.command([
+            "diff",
+            "--name-only",
+            "-z",
+            "--diff-filter=A",
+            "HEAD",
+            &id,
+            "--",
+        ]);
+        added.args(path);
+        let added = exec(added)?;
+        let ignored = self.git.run([
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+        ])?;
+        let ignored: Vec<&str> = ignored.split('\0').filter(|f| !f.is_empty()).collect();
+        let clash: Vec<&str> = added.split('\0').filter(|f| ignored.contains(f)).collect();
+        if !clash.is_empty() {
+            bail!(
+                "rollback would overwrite untracked files: {}; move them aside",
+                clash.join(", ")
+            );
+        }
+        // Both restores also refuse to overwrite a file saved since the checkpoint.
         let target = match path {
             None => {
-                self.git.run(["read-tree", "-u", "--reset", &id])?;
+                self.git
+                    .run(["read-tree", "-m", "-u", "HEAD", &id])
+                    .context("files changed during rollback; try again")?;
                 "vault".to_owned()
             }
             Some(path) => {
+                let mut changed = self.git.command(["diff", "--quiet", "--"]);
+                changed.arg(path);
+                exec(changed).context("file changed during rollback; try again")?;
                 let mut cmd = self.git.command(["restore", "--staged", "--worktree"]);
                 cmd.arg(format!("--source={id}")).arg("--").arg(path);
                 exec(cmd)?;
@@ -206,6 +243,7 @@ impl Vault {
     }
 
     /// Watches the folder and commits each burst of edits once it settles.
+    /// A failed commit is retried with backoff, edits or not.
     pub fn run(&self) -> Result<()> {
         let (tx, rx) = mpsc::channel();
         let mut debouncer = new_debouncer(DEBOUNCE, tx)?;
@@ -213,22 +251,38 @@ impl Vault {
             .watcher()
             .watch(self.folder(), RecursiveMode::Recursive)?;
         // Catch edits made while nothing was watching.
-        self.report(self.commit_pending());
+        let mut retry = self.attempt(None);
         eprintln!("watching {}", self.folder().display());
-        for events in rx {
-            match events {
-                Ok(_) => self.report(self.commit_pending()),
-                Err(e) => eprintln!("watch error: {e}"),
+        loop {
+            let event = match retry {
+                Some(wait) => rx.recv_timeout(wait),
+                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            };
+            match event {
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+                Ok(Err(e)) => eprintln!("watch error: {e}"),
+                Ok(Ok(_)) | Err(RecvTimeoutError::Timeout) => retry = self.attempt(retry),
             }
         }
-        Ok(())
     }
 
-    fn report(&self, result: Result<Option<String>>) {
-        match result {
-            Ok(Some(id)) => eprintln!("committed {id}"),
-            Ok(None) => {}
-            Err(e) => eprintln!("commit failed, will retry on the next edit: {e:#}"),
+    /// Commits pending edits; on failure returns how long to wait before
+    /// trying again, doubling `retry` up to a minute.
+    fn attempt(&self, retry: Option<Duration>) -> Option<Duration> {
+        match self.commit_pending() {
+            Ok(id) => {
+                if let Some(id) = id {
+                    eprintln!("committed {id}");
+                }
+                None
+            }
+            Err(e) => {
+                let wait = retry.map_or(Duration::from_secs(1), |w| {
+                    (w * 2).min(Duration::from_secs(60))
+                });
+                eprintln!("commit failed, retrying in {}s: {e:#}", wait.as_secs());
+                Some(wait)
+            }
         }
     }
 }
