@@ -134,8 +134,8 @@ impl Net {
         Ok(())
     }
 
-    /// Fetches `peer`'s head into this vault's copy of it. True if it moved.
-    pub async fn fetch(&self, vault: &Vault, peer: EndpointId) -> Result<bool> {
+    /// Fetches `peer`'s head into this vault's copy of it.
+    pub async fn fetch(&self, vault: &Vault, peer: EndpointId) -> Result<()> {
         let v = vault.clone();
         let haves = spawn_blocking(move || v.haves()).await??;
         let path = vault.incoming(&peer)?;
@@ -160,7 +160,7 @@ impl Net {
             let _ = std::fs::remove_file(&path);
         })?;
         if !arrived {
-            return Ok(false);
+            return Ok(());
         }
         let v = vault.clone();
         spawn_blocking(move || v.receive(&peer, &path)).await?

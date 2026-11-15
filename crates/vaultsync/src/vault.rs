@@ -414,16 +414,14 @@ impl Vault {
         ))
     }
 
-    /// Stores a peer's head from its bundle. True if it moved.
-    pub fn receive(&self, peer: &EndpointId, bundle: &Path) -> Result<bool> {
+    /// Stores a peer's head from its bundle.
+    pub fn receive(&self, peer: &EndpointId, bundle: &Path) -> Result<()> {
         let name = peer_ref(peer);
-        let before = self.git.value(["rev-parse", "-q", "--verify", &name]).ok();
         let mut cmd = self.git.command(["fetch", "-q", "--no-write-fetch-head"]);
         cmd.arg(bundle).arg(format!("+HEAD:{name}"));
         let fetched = exec(cmd);
         fs::remove_file(bundle)?;
-        fetched?;
-        Ok(self.git.value(["rev-parse", &name]).ok() != before)
+        fetched.map(drop)
     }
 
     /// Brings a peer's head into this vault: fast-forward, or a merge. Pending

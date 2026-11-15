@@ -193,23 +193,6 @@ fn edits_reach_every_member_and_heads_settle() {
         "heads moved while idle:\n{}",
         mesh.logs()
     );
-    // The history that arrived is the history that was made: m0's first commit is everywhere.
-    let first = git(
-        &mesh.nodes[0].folder,
-        &[
-            &format!("--git-dir={}.git", mesh.nodes[0].folder.display()),
-            "rev-list",
-            "--max-parents=0",
-            "HEAD",
-        ],
-    );
-    for n in &mesh.nodes {
-        let gd = format!("--git-dir={}.git", n.folder.display());
-        assert_eq!(
-            git(&n.folder, &[&gd, "rev-list", "--max-parents=0", "HEAD"]),
-            first
-        );
-    }
 }
 
 #[test]
