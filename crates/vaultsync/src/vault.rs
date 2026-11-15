@@ -1,19 +1,24 @@
 use std::ffi::OsStr;
 use std::fs::{self, File};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
-use notify_debouncer_mini::{new_debouncer, notify::RecursiveMode};
+use iroh::{EndpointId, SecretKey};
 
 use crate::git::{Git, exec};
+use crate::members::{self, MEMBERS_PATH, Members};
+use crate::merge::merge;
 
 const MACHINE_KEY: &str = "vaultsync.machine";
-const DEBOUNCE: Duration = Duration::from_millis(500);
+/// Tries before giving up on landing a sync over files that keep changing.
+const APPLY_TRIES: usize = 5;
 
 /// A folder of notes whose git directory sits beside it (`<folder>.git`), so
 /// editors and agents never see `.git`.
+#[derive(Clone)]
 pub struct Vault {
     git: Git,
 }
@@ -22,6 +27,11 @@ fn git_dir_for(folder: &Path) -> PathBuf {
     let mut dir = folder.as_os_str().to_owned();
     dir.push(".git");
     dir.into()
+}
+
+/// Where a fetched peer head is kept.
+fn peer_ref(peer: &EndpointId) -> String {
+    format!("refs/vaultsync/peers/{peer}")
 }
 
 impl Vault {
@@ -36,6 +46,13 @@ impl Vault {
 
     pub fn folder(&self) -> &Path {
         &self.git.work_tree
+    }
+
+    /// This tool's own files inside the git directory.
+    fn state(&self, name: &str) -> Result<PathBuf> {
+        let dir = self.git.git_dir.join("vaultsync");
+        fs::create_dir_all(&dir)?;
+        Ok(dir.join(name))
     }
 
     /// Makes `folder` a vault. Existing history is adopted untouched: a `.git`
@@ -69,10 +86,7 @@ impl Vault {
                 vault.git.run(["init", "-q", "-b", "main"])?;
             }
         }
-        let fresh = vault
-            .git
-            .run(["rev-parse", "--verify", "-q", "HEAD"])
-            .is_err();
+        let fresh = vault.head().is_err();
         // A bare snapshot has no index; build it from HEAD without touching refs.
         if !fresh && !beside.join("index").exists() {
             vault.git.run(["read-tree", "HEAD"])?;
@@ -82,9 +96,10 @@ impl Vault {
             None => gethostname::gethostname().to_string_lossy().into_owned(),
         };
         vault.git.run(["config", MACHINE_KEY, &machine])?;
+        vault.ensure_union_merge()?;
         if fresh {
             vault.git.run(["add", "-A"])?;
-            vault.commit("Initialize vault", true)?;
+            vault.commit("Initialize vault")?;
         }
         Ok(vault)
     }
@@ -95,42 +110,132 @@ impl Vault {
         for dir in start.ancestors() {
             let vault = Vault::at(dir.to_owned());
             if vault.git.git_dir.is_dir() && vault.machine().is_ok() {
+                vault.ensure_union_merge()?;
                 return Ok(vault);
             }
         }
         bail!("no vault at or above {}", start.display())
     }
 
+    /// Concurrent member additions merge as a union, never as markers.
+    fn ensure_union_merge(&self) -> Result<()> {
+        let attributes = self.git.git_dir.join("info").join("attributes");
+        let existing = fs::read_to_string(&attributes).unwrap_or_default();
+        let mut rule = format!("{MEMBERS_PATH} merge=union\n");
+        if !existing.lines().any(|line| line == rule.trim_end()) {
+            if !existing.is_empty() && !existing.ends_with('\n') {
+                rule.insert(0, '\n');
+            }
+            fs::create_dir_all(attributes.parent().expect("has a parent"))?;
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&attributes)?
+                .write_all(rule.as_bytes())?;
+        }
+        Ok(())
+    }
+
     fn machine(&self) -> Result<String> {
         self.git.value(["config", MACHINE_KEY])
     }
 
-    /// Serializes everything that writes to the index or makes commits.
+    fn head(&self) -> Result<String> {
+        self.git.value(["rev-parse", "--verify", "-q", "HEAD"])
+    }
+
+    /// This machine's node key, created on first use and never printed.
+    pub fn secret_key(&self) -> Result<SecretKey> {
+        let path = self.state("key")?;
+        if let Ok(bytes) = fs::read(&path) {
+            let bytes: [u8; 32] = bytes.try_into().ok().context("corrupt node key")?;
+            return Ok(SecretKey::from_bytes(&bytes));
+        }
+        let key = SecretKey::generate();
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?
+            .write_all(&key.to_bytes())?;
+        Ok(key)
+    }
+
+    pub fn node_id(&self) -> Result<EndpointId> {
+        Ok(self.secret_key()?.public())
+    }
+
+    /// The machines this one trusts: the member list at HEAD, plus itself.
+    pub fn members(&self) -> Result<Members> {
+        let mut members = members::at(&self.git, "HEAD")?.unwrap_or_default();
+        members.insert(self.node_id()?, self.machine()?);
+        Ok(members)
+    }
+
+    /// The other members, which this machine syncs with.
+    pub fn peers(&self) -> Result<Vec<EndpointId>> {
+        let me = self.node_id()?;
+        Ok(self.members()?.into_keys().filter(|id| *id != me).collect())
+    }
+
+    /// Adds a machine to the member list, in a commit signed by this one.
+    pub fn add_member(&self, id: EndpointId, name: &str) -> Result<String> {
+        let _lock = self.lock()?;
+        self.commit_pending_locked()?;
+        let mut members = self.members()?;
+        members.insert(id, name.to_owned());
+        let path = self.folder().join(MEMBERS_PATH);
+        let dir = path.parent().expect("has a parent");
+        // Never write through a symlink a synced commit put there.
+        for p in [dir, &path] {
+            if fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+                bail!(
+                    "{} is a symlink; refusing to write the member list through it",
+                    p.display()
+                );
+            }
+        }
+        fs::create_dir_all(dir)?;
+        fs::write(&path, members::format(&members))?;
+        self.git.run(["add", MEMBERS_PATH])?;
+        self.commit(&format!("Add member {name}"))
+    }
+
+    /// Serializes everything that writes to the index, the work tree or HEAD,
+    /// and finishes a sync that a crash interrupted.
     fn lock(&self) -> Result<File> {
         let file = File::create(self.git.git_dir.join("vaultsync.lock"))?;
         file.lock()?;
+        self.recover()?;
         Ok(file)
     }
 
-    /// Commits the staged changes as this machine, plus the writing agent when
-    /// `VAULTSYNC_AGENT` names one.
-    fn commit(&self, subject: &str, allow_empty: bool) -> Result<String> {
+    /// Commits the staged changes as this machine, signed with its node key,
+    /// plus the writing agent when `VAULTSYNC_AGENT` names one.
+    fn commit(&self, subject: &str) -> Result<String> {
         let machine = self.machine()?;
         let email = format!("vaultsync@{machine}");
-        let mut message = subject.to_owned();
+        let tree = self.git.value(["write-tree"])?;
+        let parent = self.head().ok();
+        let parents: Vec<&str> = parent.iter().map(String::as_str).collect();
+        let mut message = format!("{subject}\n\n");
         if let Ok(agent) = std::env::var("VAULTSYNC_AGENT") {
-            message.push_str(&format!("\n\nAgent: {agent}"));
+            message.push_str(&format!("Agent: {agent}\n"));
         }
-        let mut cmd = self.git.command(["commit", "-q", "-m", &message]);
-        if allow_empty {
-            cmd.arg("--allow-empty");
+        message.push_str(&members::sign(&self.secret_key()?, &tree, &parents));
+        let mut cmd = self.git.command(["commit-tree", &tree, "-m", &message]);
+        for p in &parents {
+            cmd.args(["-p", p]);
         }
         for (key, value) in [("NAME", &machine), ("EMAIL", &email)] {
             cmd.env(format!("GIT_AUTHOR_{key}"), value)
                 .env(format!("GIT_COMMITTER_{key}"), value);
         }
-        exec(cmd)?;
-        self.git.value(["rev-parse", "--short", "HEAD"])
+        let id = exec(cmd)?.trim_end().to_owned();
+        let mut update = vec!["update-ref", "HEAD", &id];
+        update.extend(parents.first().copied());
+        self.git.run(update)?;
+        self.git.value(["rev-parse", "--short", &id])
     }
 
     /// Commits every change in the folder, if there is any.
@@ -148,17 +253,18 @@ impl Vault {
             [one] => format!("Update {one}"),
             many => format!("Update {} files", many.len()),
         };
-        self.commit(&subject, false).map(Some)
+        self.commit(&subject).map(Some)
     }
 
     pub fn status(&self) -> Result<String> {
         let pending = self.git.run(["status", "--porcelain", "-z"])?;
         let count = pending.split('\0').filter(|e| !e.is_empty()).count();
         Ok(format!(
-            "vault:   {}\nhistory: {}\nmachine: {}\nbranch:  {}\nhead:    {}\n{count} uncommitted change{}\n",
+            "vault:   {}\nhistory: {}\nmachine: {}\nnode:    {}\nbranch:  {}\nhead:    {}\n{count} uncommitted change{}\n",
             self.folder().display(),
             self.git.git_dir.display(),
             self.machine()?,
+            self.node_id()?,
             self.git.value(["symbolic-ref", "--short", "HEAD"])?,
             self.git.value(["log", "-1", "--format=%h %s"])?,
             if count == 1 { "" } else { "s" },
@@ -239,7 +345,7 @@ impl Vault {
         {
             bail!("{what} already matches {short}");
         }
-        self.commit(&format!("Roll back {what} to {short}"), false)
+        self.commit(&format!("Roll back {what} to {short}"))
     }
 
     /// HEAD's tree with `path` as it was at `id` (absent if it was absent),
@@ -265,47 +371,176 @@ impl Vault {
         Ok(tree.trim_end().to_owned())
     }
 
-    /// Watches the folder and commits each burst of edits once it settles.
-    /// A failed commit is retried with backoff, edits or not.
-    pub fn run(&self) -> Result<()> {
-        let (tx, rx) = mpsc::channel();
-        let mut debouncer = new_debouncer(DEBOUNCE, tx)?;
-        debouncer
-            .watcher()
-            .watch(self.folder(), RecursiveMode::Recursive)?;
-        // Catch edits made while nothing was watching.
-        let mut retry = self.attempt(None);
-        eprintln!("watching {}", self.folder().display());
-        loop {
-            let event = match retry {
-                Some(wait) => rx.recv_timeout(wait),
-                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
-            };
-            match event {
-                Err(RecvTimeoutError::Disconnected) => return Ok(()),
-                Ok(Err(e)) => eprintln!("watch error: {e}"),
-                Ok(Ok(_)) | Err(RecvTimeoutError::Timeout) => retry = self.attempt(retry),
-            }
-        }
+    /// Commit ids to tell a peer this machine already has.
+    pub fn haves(&self) -> Result<Vec<String>> {
+        let refs = self.git.run([
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/vaultsync/peers",
+        ])?;
+        let head = self.head()?;
+        Ok(refs.lines().map(str::to_owned).chain([head]).collect())
     }
 
-    /// Commits pending edits; on failure returns how long to wait before
-    /// trying again, doubling `retry` up to a minute.
-    fn attempt(&self, retry: Option<Duration>) -> Option<Duration> {
-        match self.commit_pending() {
-            Ok(id) => {
-                if let Some(id) = id {
-                    eprintln!("committed {id}");
-                }
-                None
+    /// The subset of `ids` that are commits here.
+    pub fn present(&self, ids: &[String]) -> Result<Vec<String>> {
+        let query: String = ids.iter().map(|id| format!("{id}^{{commit}}\n")).collect();
+        let answers = self
+            .git
+            .run_stdin(["cat-file", "--batch-check=%(objectname)"], &query)?;
+        Ok(ids
+            .iter()
+            .zip(answers.lines())
+            .filter(|(_, a)| !a.ends_with(" missing"))
+            .map(|(id, _)| id.clone())
+            .collect())
+    }
+
+    /// Whether HEAD has commits that `haves` lack.
+    pub fn has_news(&self, haves: &[String]) -> Result<bool> {
+        let mut args = vec!["rev-list", "-n1", "HEAD", "--not"];
+        args.extend(haves.iter().map(String::as_str));
+        Ok(!self.git.run(args)?.is_empty())
+    }
+
+    /// `git bundle create - HEAD --not <haves>`, for streaming to a peer.
+    pub fn bundle_command(&self, haves: &[String]) -> std::process::Command {
+        let mut cmd = self
+            .git
+            .command(["bundle", "create", "-q", "-", "HEAD", "--not"]);
+        cmd.args(haves);
+        cmd
+    }
+
+    /// Path for a bundle arriving from `peer`.
+    pub fn incoming(&self, peer: &EndpointId) -> Result<PathBuf> {
+        // A fresh name per attempt: no two transfers ever share a file.
+        static ATTEMPT: AtomicU64 = AtomicU64::new(0);
+        let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        self.state(&format!(
+            "incoming-{}-{pid}-{attempt}.bundle",
+            peer.fmt_short()
+        ))
+    }
+
+    /// Stores a peer's head from its bundle.
+    pub fn receive(&self, peer: &EndpointId, bundle: &Path) -> Result<()> {
+        let name = peer_ref(peer);
+        let mut cmd = self.git.command(["fetch", "-q", "--no-write-fetch-head"]);
+        cmd.arg(bundle).arg(format!("+HEAD:{name}"));
+        let fetched = exec(cmd);
+        fs::remove_file(bundle)?;
+        fetched.map(drop)
+    }
+
+    /// Brings a peer's head into this vault: fast-forward, or a merge. Pending
+    /// edits are committed first, and a file edited while the sync runs is
+    /// never overwritten. Returns the new HEAD if it moved.
+    pub fn integrate(&self, peer: &EndpointId) -> Result<Option<String>> {
+        let _lock = self.lock()?;
+        let Ok(tip) = self
+            .git
+            .value(["rev-parse", "-q", "--verify", &peer_ref(peer)])
+        else {
+            return Ok(None);
+        };
+        for _ in 0..APPLY_TRIES {
+            self.commit_pending_locked()?;
+            let head = self.head()?;
+            if self.is_ancestor(&tip, &head) {
+                return Ok(None);
             }
-            Err(e) => {
-                let wait = retry.map_or(Duration::from_secs(1), |w| {
-                    (w * 2).min(Duration::from_secs(60))
-                });
-                eprintln!("commit failed, retrying in {}s: {e:#}", wait.as_secs());
-                Some(wait)
+            members::validate(&self.git, &head, &tip, &self.members()?)
+                .with_context(|| format!("refusing history from {}", peer.fmt_short()))?;
+            // Merge only when each side has edits the other lacks. A head that
+            // already holds all of ours is taken as is; merging it again is how
+            // a ring of peers would keep re-merging the same edits forever.
+            let ours_covered = self.edits_beyond(&head, &tip)? == 0;
+            let theirs_covered = self.edits_beyond(&tip, &head)? == 0;
+            let new = match (ours_covered, theirs_covered) {
+                // Same edits, different merges: the greater id wins everywhere.
+                (true, true) if head > tip => return Ok(None),
+                (true, _) => tip.clone(),
+                // We hold all of theirs and more; they take ours.
+                (false, true) => return Ok(None),
+                (false, false) => merge(&self.git, &head, &tip)?,
+            };
+            if self.apply(&head, &new)? {
+                return Ok(Some(new));
             }
         }
+        bail!("files kept changing; will retry")
+    }
+
+    /// Edits (non-merge commits) reachable from `a` but not from `b`.
+    fn edits_beyond(&self, a: &str, b: &str) -> Result<usize> {
+        Ok(self
+            .git
+            .value(["rev-list", "--no-merges", "--count", a, "--not", b])?
+            .parse()?)
+    }
+
+    fn is_ancestor(&self, a: &str, b: &str) -> bool {
+        self.git.run(["merge-base", "--is-ancestor", a, b]).is_ok()
+    }
+
+    /// Moves HEAD, index and work tree from `old` to `new`. False if a file
+    /// git would change was edited meanwhile; nothing is touched then. The
+    /// intent file records how far it got, for `recover`.
+    fn apply(&self, old: &str, new: &str) -> Result<bool> {
+        if hooked("pause-before-apply") {
+            eprintln!("test hook: pausing before apply");
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        // git's check below treats a deleted tracked file as clean and would
+        // write it back, so a rename made since the checkpoint would leave
+        // both names. Any tracked change since then: commit it and merge again.
+        if self.git.run(["diff", "--quiet"]).is_err() {
+            return Ok(false);
+        }
+        let intent = self.state("apply")?;
+        fs::write(&intent, format!("started {old} {new}\n"))?;
+        crash_if_hooked("crash-before-worktree");
+        if self.git.run(["read-tree", "-m", "-u", old, new]).is_err() {
+            fs::remove_file(&intent)?;
+            return Ok(false);
+        }
+        fs::write(&intent, format!("written {old} {new}\n"))?;
+        crash_if_hooked("crash-after-worktree");
+        self.git.run(["update-ref", "HEAD", new, old])?;
+        fs::remove_file(&intent)?;
+        Ok(true)
+    }
+
+    /// Settles an `apply` a crash interrupted, never undoing what a user did
+    /// since. Once the work tree was fully written only HEAD is left to move,
+    /// and any difference from `new` is the user's. Before that, git may have
+    /// written part of `new`: HEAD stays at `old`, and whatever is on disk is
+    /// committed as an edit and merged again.
+    fn recover(&self) -> Result<()> {
+        let intent = self.state("apply")?;
+        let Ok(text) = fs::read_to_string(&intent) else {
+            return Ok(());
+        };
+        let [phase, old, new] = text.split_whitespace().collect::<Vec<_>>()[..] else {
+            bail!("corrupt apply intent: {text}");
+        };
+        if phase == "written" && self.head()? == old {
+            self.git.run(["update-ref", "HEAD", new, old])?;
+        }
+        fs::remove_file(&intent)?;
+        Ok(())
+    }
+}
+
+/// Fault injection for tests: `VAULTSYNC_TEST_HOOK=<name>`.
+pub fn hooked(name: &str) -> bool {
+    std::env::var("VAULTSYNC_TEST_HOOK").as_deref() == Ok(name)
+}
+
+fn crash_if_hooked(name: &str) {
+    if hooked(name) {
+        std::process::exit(9);
     }
 }
