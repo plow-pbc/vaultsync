@@ -1,10 +1,16 @@
+mod daemon;
 mod git;
+mod members;
+mod merge;
+mod net;
 mod vault;
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use iroh::EndpointId;
 
 use vault::Vault;
 
@@ -30,6 +36,11 @@ enum Cmd {
     },
     /// Show the vault, this machine, and uncommitted changes.
     Status,
+    /// Print this machine's node id, which other members add.
+    Id,
+    /// Change the member list.
+    #[command(subcommand)]
+    Member(MemberCmd),
     /// List commits, newest first.
     Log {
         #[arg(short = 'n', default_value_t = 20)]
@@ -43,26 +54,55 @@ enum Cmd {
         /// Path relative to the vault.
         path: Option<PathBuf>,
     },
-    /// Watch the vault and commit edits as they happen.
-    Run,
+    /// Commit edits as they happen and sync with the other members.
+    Run {
+        /// Seconds between catch-ups with every member.
+        #[arg(long, default_value_t = 30)]
+        catch_up: u64,
+        /// Find peers through address files in this directory instead of the
+        /// network (tests, offline use).
+        #[arg(long, hide = true)]
+        addr_dir: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum MemberCmd {
+    /// Trust another machine, by the id `vaultsync id` prints there.
+    Add {
+        id: EndpointId,
+        #[arg(long)]
+        name: String,
+    },
+    /// List the members.
+    List,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let open = || Vault::open(&cli.vault);
     match cli.command {
         Cmd::Init { folder, machine } => {
             let vault = Vault::init(&folder, machine)?;
             print!("{}", vault.status()?);
         }
-        Cmd::Status => print!("{}", Vault::open(&cli.vault)?.status()?),
-        Cmd::Log { limit, path } => {
-            print!("{}", Vault::open(&cli.vault)?.log(limit, path.as_deref())?)
+        Cmd::Status => print!("{}", open()?.status()?),
+        Cmd::Id => println!("{}", open()?.node_id()?),
+        Cmd::Member(MemberCmd::Add { id, name }) => {
+            println!("committed {}", open()?.add_member(id, &name)?)
         }
+        Cmd::Member(MemberCmd::List) => print!("{}", members::format(&open()?.members()?)),
+        Cmd::Log { limit, path } => print!("{}", open()?.log(limit, path.as_deref())?),
         Cmd::Rollback { commit, path } => {
-            let id = Vault::open(&cli.vault)?.rollback(&commit, path.as_deref())?;
-            println!("committed {id}");
+            println!("committed {}", open()?.rollback(&commit, path.as_deref())?)
         }
-        Cmd::Run => Vault::open(&cli.vault)?.run()?,
+        Cmd::Run { catch_up, addr_dir } => daemon::run(
+            open()?,
+            daemon::Opts {
+                catch_up: Duration::from_secs(catch_up),
+                addr_dir,
+            },
+        )?,
     }
     Ok(())
 }
