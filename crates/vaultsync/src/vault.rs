@@ -445,16 +445,32 @@ impl Vault {
             }
             members::validate(&self.git, &head, &tip, &self.members()?)
                 .with_context(|| format!("refusing history from {}", peer.fmt_short()))?;
-            let new = if self.is_ancestor(&head, &tip) {
-                tip.clone()
-            } else {
-                merge(&self.git, &head, &tip)?
+            // Merge only when each side has edits the other lacks. A head that
+            // already holds all of ours is taken as is; merging it again is how
+            // a ring of peers would keep re-merging the same edits forever.
+            let ours_covered = self.edits_beyond(&head, &tip)? == 0;
+            let theirs_covered = self.edits_beyond(&tip, &head)? == 0;
+            let new = match (ours_covered, theirs_covered) {
+                // Same edits, different merges: the greater id wins everywhere.
+                (true, true) if head > tip => return Ok(None),
+                (true, _) => tip.clone(),
+                // We hold all of theirs and more; they take ours.
+                (false, true) => return Ok(None),
+                (false, false) => merge(&self.git, &head, &tip)?,
             };
             if self.apply(&head, &new)? {
                 return Ok(Some(new));
             }
         }
         bail!("files kept changing; will retry")
+    }
+
+    /// Edits (non-merge commits) reachable from `a` but not from `b`.
+    fn edits_beyond(&self, a: &str, b: &str) -> Result<usize> {
+        Ok(self
+            .git
+            .value(["rev-list", "--no-merges", "--count", a, "--not", b])?
+            .parse()?)
     }
 
     fn is_ancestor(&self, a: &str, b: &str) -> bool {
