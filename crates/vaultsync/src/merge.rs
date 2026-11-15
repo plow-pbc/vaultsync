@@ -49,14 +49,20 @@ pub fn merge(git: &Git, a: &str, b: &str) -> Result<String> {
             .or_default()
             .insert(stage, (mode, oid));
     }
-    let binary: Vec<(String, &str, &str)> = conflicts
+    // Both sides changed it and git left no markers (binary content, or a
+    // `binary`/`-merge` attribute): git kept ours, so keep theirs beside it.
+    let marker = format!("<<<<<<< {}", &ours[..12]);
+    let unmarked: Vec<(String, &str, &str)> = conflicts
         .iter()
         .filter_map(|(path, stages)| Some((path, stages.get("2")?, stages.get("3")?)))
-        .filter(|(_, (_, o2), (_, o3))| is_binary(git, o2) || is_binary(git, o3))
+        .filter(|(path, _, _)| {
+            git.run(["cat-file", "blob", &format!("{tree}:{path}")])
+                .map_or(true, |text| !text.contains(&marker))
+        })
         .map(|(path, _, (mode, oid))| (side_name(path, oid), *mode, *oid))
         .collect();
-    if !binary.is_empty() {
-        tree = add_to_tree(git, &tree, &binary)?;
+    if !unmarked.is_empty() {
+        tree = add_to_tree(git, &tree, &unmarked)?;
     }
 
     let mut message = "Merge".to_owned();
@@ -89,13 +95,6 @@ pub fn merge(git: &Git, a: &str, b: &str) -> Result<String> {
             .env(format!("GIT_{who}_DATE"), &date);
     }
     Ok(exec(cmd)?.trim_end().to_owned())
-}
-
-/// git's own test: a NUL byte in the first 8000 bytes.
-fn is_binary(git: &Git, oid: &str) -> bool {
-    git.run(["cat-file", "blob", oid])
-        .map(|text| text.chars().take(8000).any(|c| c == '\0'))
-        .unwrap_or(false)
 }
 
 /// `photo.png` → `photo.conflict-1a2b3c4d.png`, beside the original.
