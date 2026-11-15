@@ -1,7 +1,7 @@
 //! `vaultsync run`: commit edits as they happen and keep in step with every
 //! member that can be reached.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -74,20 +74,18 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
         };
         match event {
             Event::Edited => edited(&vault, &net, &mut retry).await,
-            Event::Poke(peer) => fetches.start(&vault, &net, &events, peer, true),
+            Event::Poke(peer) => fetches.start(&vault, &net, &events, peer),
             Event::CatchUp => {
                 for peer in blocking(&vault, Vault::peers).await.unwrap_or_default() {
-                    fetches.start(&vault, &net, &events, peer, false);
+                    fetches.start(&vault, &net, &events, peer);
                 }
             }
-            Event::Fetched(peer, id, result) => {
-                if !fetches.finish(&vault, &net, &events, peer, id) {
-                    continue;
-                }
+            Event::Fetched(peer, result) => {
                 match result {
                     Ok(()) => integrate(&vault, &net, peer).await,
                     Err(e) => eprintln!("could not fetch from {}: {e:#}", peer.fmt_short()),
                 }
+                fetches.finish(&vault, &net, &events, peer);
             }
         }
     }
@@ -134,14 +132,12 @@ async fn edited(vault: &Vault, net: &Net, retry: &mut Retry) {
 
 /// Fetches run side by side, so a slow peer holds up neither edits nor other
 /// peers; each result comes back to the event loop, which integrates them one
-/// at a time. One fetch per peer: a catch-up meanwhile runs after it, while a
-/// poke (the peer is up and has news) replaces it, since the running attempt
-/// may be stuck dialing an address the peer no longer has.
+/// at a time. One fetch per peer: a request meanwhile runs after it. A running
+/// fetch is never cancelled, since its bundle import can't be.
 #[derive(Default)]
 struct Fetches {
-    running: HashMap<EndpointId, (u64, tokio::task::JoinHandle<()>)>,
+    running: HashSet<EndpointId>,
     again: HashSet<EndpointId>,
-    next: u64,
 }
 
 impl Fetches {
@@ -151,45 +147,32 @@ impl Fetches {
         net: &Net,
         events: &mpsc::UnboundedSender<Event>,
         peer: EndpointId,
-        replace: bool,
     ) {
-        if let Some((_, task)) = self.running.get(&peer) {
-            if !replace {
-                self.again.insert(peer);
-                return;
-            }
-            task.abort();
+        if !self.running.insert(peer) {
+            self.again.insert(peer);
+            return;
         }
-        self.next += 1;
-        let id = self.next;
         let (vault, net, events) = (vault.clone(), net.clone(), events.clone());
-        let task = tokio::spawn(async move {
+        tokio::spawn(async move {
             let result = match tokio::time::timeout(FETCH_TIMEOUT, net.fetch(&vault, peer)).await {
                 Ok(result) => result.map(|_| ()),
                 Err(_) => Err(anyhow::anyhow!("timed out")),
             };
-            let _ = events.send(Event::Fetched(peer, id, result));
+            let _ = events.send(Event::Fetched(peer, result));
         });
-        self.running.insert(peer, (id, task));
     }
 
-    /// True if `id` is the peer's current fetch (not one since replaced).
     fn finish(
         &mut self,
         vault: &Vault,
         net: &Net,
         events: &mpsc::UnboundedSender<Event>,
         peer: EndpointId,
-        id: u64,
-    ) -> bool {
-        if self.running.get(&peer).map(|(current, _)| *current) != Some(id) {
-            return false;
-        }
+    ) {
         self.running.remove(&peer);
         if self.again.remove(&peer) {
-            self.start(vault, net, events, peer, false);
+            self.start(vault, net, events, peer);
         }
-        true
     }
 }
 

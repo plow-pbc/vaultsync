@@ -36,8 +36,8 @@ pub enum Event {
     /// A peer has new commits.
     Poke(EndpointId),
     CatchUp,
-    /// A fetch from this peer finished; the number tells attempts apart.
-    Fetched(EndpointId, u64, Result<()>),
+    /// A fetch from this peer finished.
+    Fetched(EndpointId, Result<()>),
 }
 
 /// How peers find each other: n0's relays and address lookup, or (for tests
