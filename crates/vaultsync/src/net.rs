@@ -7,7 +7,7 @@
 //! the member list is closed before it can ask anything.
 
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -25,8 +25,11 @@ const ALPN: &[u8] = b"vaultsync/0";
 const MAGIC: &[u8] = b"VS0";
 const FETCH: u8 = 1;
 const POKE: u8 = 2;
+/// The one request a non-member may make: a joining machine with an invite.
+const JOIN: u8 = 3;
 const BUNDLE_FOLLOWS: u8 = 0;
 const NOTHING_NEW: u8 = 1;
+const REFUSED: u8 = 2;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -153,6 +156,33 @@ impl Net {
         Ok(moved)
     }
 
+    /// Presents an invite secret to `inviter` and returns the bundle of the
+    /// vault's history it sends back.
+    pub async fn join(
+        &self,
+        vault: &Vault,
+        inviter: EndpointId,
+        secret: &[u8; 32],
+    ) -> Result<PathBuf> {
+        let mut body = secret.to_vec();
+        body.extend_from_slice(vault.machine_name()?.as_bytes());
+        let (conn, mut recv, status) = self
+            .request(inviter, JOIN, &body)
+            .await
+            .context("could not reach the inviting machine (is `vaultsync run` running there?)")?;
+        if status != BUNDLE_FOLLOWS {
+            let reason = recv.read_to_end(1024).await.unwrap_or_default();
+            conn.close(0u32.into(), b"done");
+            bail!("{}", String::from_utf8_lossy(&reason));
+        }
+        let path = vault.incoming(&inviter)?;
+        let mut file = tokio::fs::File::create(&path).await?;
+        tokio::io::copy(&mut recv, &mut file).await?;
+        file.flush().await?;
+        conn.close(0u32.into(), b"done");
+        Ok(path)
+    }
+
     /// Answers peers until the endpoint closes.
     pub async fn serve(self, vault: Vault, events: UnboundedSender<Event>) {
         while let Some(incoming) = self.endpoint.accept().await {
@@ -169,29 +199,26 @@ impl Net {
 async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>) -> Result<()> {
     let conn = incoming.await?;
     let peer = conn.remote_id();
-    let v = vault.clone();
-    if !spawn_blocking(move || v.members())
-        .await??
-        .contains_key(&peer)
-    {
-        eprintln!("refused connection from {}: not a member", peer.fmt_short());
-        conn.close(1u32.into(), b"not a member");
-        return Ok(());
-    }
     if crate::vault::hooked("stall-serving") {
         std::future::pending::<()>().await;
     }
     let (mut send, mut recv) = conn.accept_bi().await?;
     let request = timeout(REQUEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
-    let Some(rest) = request.strip_prefix(MAGIC) else {
+    let Some((&kind, body)) = request.strip_prefix(MAGIC).and_then(|r| r.split_first()) else {
         bail!("{} sent a malformed request", peer.fmt_short());
     };
-    match rest.split_first() {
-        Some((&POKE, _)) => {
+    let v = vault.clone();
+    if kind != JOIN && !spawn_blocking(move || v.members()).await??.contains(&peer) {
+        eprintln!("refused connection from {}: not a member", peer.fmt_short());
+        conn.close(1u32.into(), b"not a member");
+        return Ok(());
+    }
+    match kind {
+        POKE => {
             let _ = events.send(Event::Poke(peer));
             send.write_all(&[NOTHING_NEW]).await?;
         }
-        Some((&FETCH, body)) => {
+        FETCH => {
             let haves: Vec<String> = String::from_utf8_lossy(body)
                 .lines()
                 .map(str::to_owned)
@@ -204,17 +231,45 @@ async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>
             })
             .await??;
             if news {
-                send.write_all(&[BUNDLE_FOLLOWS]).await?;
-                let mut child = tokio::process::Command::from(vault.bundle_command(&present))
-                    .stdout(Stdio::piped())
-                    .kill_on_drop(true)
-                    .spawn()?;
-                tokio::io::copy(child.stdout.as_mut().expect("piped"), &mut send).await?;
-                if !child.wait().await?.success() {
-                    bail!("git bundle failed");
-                }
+                send_bundle(&vault, &present, &mut send).await?;
             } else {
                 send.write_all(&[NOTHING_NEW]).await?;
+            }
+        }
+        JOIN if body.len() > 32 => {
+            let secret: [u8; 32] = body[..32].try_into().expect("32 bytes");
+            // One short line: the name goes into the member list as is.
+            let name: String = String::from_utf8_lossy(&body[32..])
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .chars()
+                .take(64)
+                .collect();
+            let name = if name.is_empty() {
+                "unnamed".to_owned()
+            } else {
+                name
+            };
+            let (v, n) = (vault.clone(), name.clone());
+            let admitted = spawn_blocking(move || {
+                v.consume_invite(&secret)?;
+                v.add_member(peer, &n)
+            })
+            .await?;
+            match admitted {
+                Ok(_) => {
+                    eprintln!("{name} ({}) joined", peer.fmt_short());
+                    // Tell the other members about the newcomer.
+                    let _ = events.send(Event::Edited);
+                    send_bundle(&vault, &[], &mut send).await?;
+                }
+                Err(e) => {
+                    eprintln!("refused join from {}: {e:#}", peer.fmt_short());
+                    send.write_all(&[REFUSED]).await?;
+                    send.write_all(format!("{e:#}").as_bytes()).await?;
+                }
             }
         }
         _ => bail!("{} sent an unknown request", peer.fmt_short()),
@@ -222,5 +277,19 @@ async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>
     send.finish()?;
     // Let the client close once it has everything.
     let _ = timeout(Duration::from_secs(30), conn.closed()).await;
+    Ok(())
+}
+
+/// Streams a bundle of HEAD, less what the peer `haves`.
+async fn send_bundle(vault: &Vault, haves: &[String], send: &mut noq::SendStream) -> Result<()> {
+    send.write_all(&[BUNDLE_FOLLOWS]).await?;
+    let mut child = tokio::process::Command::from(vault.bundle_command(haves))
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()?;
+    tokio::io::copy(child.stdout.as_mut().expect("piped"), send).await?;
+    if !child.wait().await?.success() {
+        bail!("git bundle failed");
+    }
     Ok(())
 }

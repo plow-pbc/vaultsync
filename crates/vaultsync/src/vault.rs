@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use iroh::{EndpointId, SecretKey};
@@ -139,7 +140,7 @@ impl Vault {
         self.git.value(["config", MACHINE_KEY])
     }
 
-    fn head(&self) -> Result<String> {
+    pub fn head(&self) -> Result<String> {
         self.git.value(["rev-parse", "--verify", "-q", "HEAD"])
     }
 
@@ -167,27 +168,153 @@ impl Vault {
     /// The machines this one trusts: the member list at HEAD, plus itself.
     pub fn members(&self) -> Result<Members> {
         let mut members = members::at(&self.git, "HEAD")?.unwrap_or_default();
-        members.insert(self.node_id()?, self.machine()?);
+        members
+            .listed
+            .entry(self.node_id()?)
+            .or_insert(self.machine()?);
         Ok(members)
     }
 
     /// The other members, which this machine syncs with.
     pub fn peers(&self) -> Result<Vec<EndpointId>> {
         let me = self.node_id()?;
-        Ok(self.members()?.into_keys().filter(|id| *id != me).collect())
+        let members = self.members()?;
+        Ok(members
+            .active()
+            .map(|(id, _)| *id)
+            .filter(|id| *id != me)
+            .collect())
     }
 
     /// Adds a machine to the member list, in a commit signed by this one.
     pub fn add_member(&self, id: EndpointId, name: &str) -> Result<String> {
+        self.change_members(&format!("Add member {name}"), |members| {
+            if members.removed.contains_key(&id) {
+                bail!("{name} was removed; it can only come back by joining with a fresh invite");
+            }
+            members.listed.insert(id, name.to_owned());
+            Ok(())
+        })
+    }
+
+    /// Removes a machine, by node id or name. Every member refuses it once the
+    /// removal reaches them, and it can never be listed again.
+    pub fn remove_member(&self, device: &str) -> Result<String> {
+        let me = self.node_id()?;
+        let members = self.members()?;
+        let found: Vec<(EndpointId, String)> = members
+            .active()
+            .filter(|(id, name)| id.to_string() == device || name.as_str() == device)
+            .map(|(id, name)| (*id, name.clone()))
+            .collect();
+        let [(id, name)] = &found[..] else {
+            bail!("{device} names {} members; use its node id", found.len());
+        };
+        if *id == me {
+            bail!("this machine can't remove itself; remove it from another member");
+        }
+        self.change_members(&format!("Remove member {name}"), |members| {
+            members.listed.remove(id);
+            members.removed.insert(*id, name.clone());
+            Ok(())
+        })
+    }
+
+    /// Edits the member list and commits it, signed by this machine.
+    fn change_members(
+        &self,
+        subject: &str,
+        edit: impl FnOnce(&mut Members) -> Result<()>,
+    ) -> Result<String> {
         let _lock = self.lock()?;
         self.commit_pending_locked()?;
         let mut members = self.members()?;
-        members.insert(id, name.to_owned());
+        edit(&mut members)?;
         let path = self.folder().join(MEMBERS_PATH);
+        let text = members::format(&members);
+        if fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
+            return self.git.value(["rev-parse", "--short", "HEAD"]);
+        }
         fs::create_dir_all(path.parent().expect("has a parent"))?;
-        fs::write(&path, members::format(&members))?;
+        fs::write(&path, text)?;
         self.git.run(["add", MEMBERS_PATH])?;
-        self.commit(&format!("Add member {name}"))
+        self.commit(subject)
+    }
+
+    /// Records a one-time invite valid for `ttl` and returns its secret. Only
+    /// a hash of the secret is kept here.
+    pub fn create_invite(&self, ttl: Duration) -> Result<[u8; 32]> {
+        let secret: [u8; 32] = rand::random();
+        let expires = SystemTime::now() + ttl;
+        let secs = expires.duration_since(UNIX_EPOCH)?.as_secs();
+        fs::write(self.invite_path(&secret)?, secs.to_string())?;
+        Ok(secret)
+    }
+
+    /// Uses up an invite: a second use, an unknown one or an expired one fails.
+    pub fn consume_invite(&self, secret: &[u8; 32]) -> Result<()> {
+        let path = self.invite_path(secret)?;
+        let expires = fs::read_to_string(&path).ok();
+        // Removing it is the atomic claim: of two joins racing, one wins.
+        if fs::remove_file(&path).is_err() {
+            bail!("this invite code is unknown or was already used");
+        }
+        let expires: u64 = expires.unwrap_or_default().trim().parse().unwrap_or(0);
+        if SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() > expires {
+            bail!("this invite code has expired");
+        }
+        Ok(())
+    }
+
+    fn invite_path(&self, secret: &[u8; 32]) -> Result<PathBuf> {
+        let dir = self.state("invites")?;
+        fs::create_dir_all(&dir)?;
+        Ok(dir.join(blake3::hash(secret).to_hex().as_str()))
+    }
+
+    /// An empty vault for a machine about to join: no commits yet. Refuses a
+    /// folder that already has files or history beside it.
+    pub fn for_join(folder: &Path, machine: Option<String>) -> Result<Vault> {
+        let has_files = fs::read_dir(folder).is_ok_and(|mut entries| entries.next().is_some());
+        if has_files || git_dir_for(folder).exists() {
+            bail!(
+                "{} already has files or history; join into an empty or new folder (--folder)",
+                folder.display()
+            );
+        }
+        fs::create_dir_all(folder)?;
+        let vault = Vault::at(folder.canonicalize()?);
+        vault.git.run(["init", "-q", "-b", "main"])?;
+        let machine = match machine {
+            Some(m) => m,
+            None => gethostname::gethostname().to_string_lossy().into_owned(),
+        };
+        vault.git.run(["config", MACHINE_KEY, &machine])?;
+        vault.ensure_union_merge()?;
+        Ok(vault)
+    }
+
+    /// Takes the inviter's full history from its bundle and fills the folder.
+    pub fn adopt(&self, bundle: &Path) -> Result<()> {
+        let mut cmd =
+            self.git
+                .command(["fetch", "-q", "--update-head-ok", "--no-write-fetch-head"]);
+        cmd.arg(bundle).arg("+HEAD:refs/heads/main");
+        exec(cmd)?;
+        fs::remove_file(bundle)?;
+        self.git.run(["read-tree", "-u", "--reset", "HEAD"])?;
+        Ok(())
+    }
+
+    /// Removes a vault [`for_join`](Self::for_join) made, after a failed join.
+    pub fn discard(self) -> Result<()> {
+        fs::remove_dir_all(&self.git.git_dir)?;
+        fs::remove_dir_all(self.folder())?;
+        Ok(())
+    }
+
+    pub fn machine_name(&self) -> Result<String> {
+        self.machine()
     }
 
     /// Serializes everything that writes to the index, the work tree or HEAD,
@@ -394,10 +521,10 @@ impl Vault {
 
     /// `git bundle create - HEAD --not <haves>`, for streaming to a peer.
     pub fn bundle_command(&self, haves: &[String]) -> std::process::Command {
-        let mut cmd = self
-            .git
-            .command(["bundle", "create", "-q", "-", "HEAD", "--not"]);
-        cmd.args(haves);
+        let mut cmd = self.git.command(["bundle", "create", "-q", "-", "HEAD"]);
+        if !haves.is_empty() {
+            cmd.arg("--not").args(haves);
+        }
         cmd
     }
 
