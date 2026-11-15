@@ -399,27 +399,33 @@ fn what_a_user_does_after_an_interrupted_sync_survives() {
 
 #[test]
 fn a_rename_interrupted_halfway_does_not_bring_back_the_old_note() {
-    let mut mesh = Mesh::new(2);
-    mesh.nodes[0].write("old.md", "note\n");
-    mesh.start_all();
-    mesh.converged(20);
-    mesh.nodes[0].stop();
-    let b = &mesh.nodes[1];
-    fs::rename(b.folder.join("old.md"), b.folder.join("new.md")).unwrap();
-    mesh.nodes[1].committed();
+    // m0 dies as git starts writing m1's rename, with either half done.
+    for new_written_first in [true, false] {
+        let mut mesh = Mesh::new(2);
+        mesh.nodes[0].write("old.md", "note\n");
+        mesh.start_all();
+        mesh.converged(20);
+        mesh.nodes[0].stop();
+        let b = &mesh.nodes[1];
+        fs::rename(b.folder.join("old.md"), b.folder.join("new.md")).unwrap();
+        mesh.nodes[1].committed();
 
-    // m0 dies as git starts writing m1's rename: the new name is on disk,
-    // the old one not yet removed.
-    let addrs = mesh.addrs.clone();
-    mesh.nodes[0].start_with(&addrs, Some("crash-before-worktree"));
-    crashed(&mut mesh.nodes[0]);
-    mesh.nodes[0].write("new.md", "note\n");
+        let addrs = mesh.addrs.clone();
+        mesh.nodes[0].start_with(&addrs, Some("crash-before-worktree"));
+        crashed(&mut mesh.nodes[0]);
+        let a = &mesh.nodes[0];
+        if new_written_first {
+            a.write("new.md", "note\n");
+        } else {
+            fs::remove_file(a.folder.join("old.md")).unwrap();
+        }
 
-    mesh.start(0);
-    mesh.converged(AFTER_RESTART);
-    for n in &mesh.nodes {
-        assert_eq!(n.read("old.md"), None, "{}: the old note came back", n.name);
-        assert_eq!(n.read("new.md").as_deref(), Some("note\n"), "{}", n.name);
+        mesh.start(0);
+        mesh.converged(AFTER_RESTART);
+        for n in &mesh.nodes {
+            assert_eq!(n.read("old.md"), None, "{}: the old note came back", n.name);
+            assert_eq!(n.read("new.md").as_deref(), Some("note\n"), "{}", n.name);
+        }
     }
 }
 

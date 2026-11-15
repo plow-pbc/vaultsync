@@ -118,11 +118,12 @@ impl Vault {
     /// Concurrent member additions merge as a union, never as markers.
     fn ensure_union_merge(&self) -> Result<()> {
         let attributes = self.git.git_dir.join("info").join("attributes");
-        let rule = format!("{MEMBERS_PATH} merge=union\n");
-        if !fs::read_to_string(&attributes)
-            .unwrap_or_default()
-            .contains(&rule)
-        {
+        let existing = fs::read_to_string(&attributes).unwrap_or_default();
+        let mut rule = format!("{MEMBERS_PATH} merge=union\n");
+        if !existing.contains(&rule) {
+            if !existing.is_empty() && !existing.ends_with('\n') {
+                rule.insert(0, '\n');
+            }
             fs::create_dir_all(attributes.parent().expect("has a parent"))?;
             fs::OpenOptions::new()
                 .create(true)

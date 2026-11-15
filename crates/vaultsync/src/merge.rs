@@ -49,18 +49,22 @@ pub fn merge(git: &Git, a: &str, b: &str) -> Result<String> {
             .or_default()
             .insert(stage, (mode, oid));
     }
-    // Both sides changed it and git left no markers (binary content, or a
-    // `binary`/`-merge` attribute): git kept ours, so keep theirs beside it.
-    let marker = format!("<<<<<<< {}", &ours[..12]);
-    let unmarked: Vec<(String, &str, &str)> = conflicts
-        .iter()
-        .filter_map(|(path, stages)| Some((path, stages.get("2")?, stages.get("3")?)))
-        .filter(|(path, _, _)| {
-            git.run(["cat-file", "blob", &format!("{tree}:{path}")])
-                .map_or(true, |text| !text.contains(&marker))
-        })
-        .map(|(path, _, (mode, oid))| (side_name(path, oid), *mode, *oid))
-        .collect();
+    // Both sides changed it, yet git left one side's version as is (binary
+    // content, or a `binary`/`-merge` attribute): keep the other beside it.
+    let mut unmarked: Vec<(String, &str, &str)> = Vec::new();
+    for (path, stages) in &conflicts {
+        let (Some(&(m2, o2)), Some(&(m3, o3))) = (stages.get("2"), stages.get("3")) else {
+            continue;
+        };
+        let kept = git
+            .value(["rev-parse", &format!("{tree}:{path}")])
+            .unwrap_or_default();
+        if kept == o2 {
+            unmarked.push((side_name(path, o3), m3, o3));
+        } else if kept == o3 {
+            unmarked.push((side_name(path, o2), m2, o2));
+        }
+    }
     if !unmarked.is_empty() {
         tree = add_to_tree(git, &tree, &unmarked)?;
     }
