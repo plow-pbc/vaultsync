@@ -212,9 +212,9 @@ impl Vault {
         debouncer
             .watcher()
             .watch(self.folder(), RecursiveMode::Recursive)?;
-        eprintln!("watching {}", self.folder().display());
         // Catch edits made while nothing was watching.
         self.report(self.commit_pending());
+        eprintln!("watching {}", self.folder().display());
         for events in rx {
             match events {
                 Ok(_) => self.report(self.commit_pending()),
