@@ -154,11 +154,12 @@ impl Node {
             .append(true)
             .open(&self.log)
             .unwrap();
+        // The log spans restarts: wait for this start's line, not an old one.
+        let started = format!("as node {}", self.id);
+        let before = self.log_text().matches(&started).count();
         self.daemon = Some(cmd.stderr(log).stdout(Stdio::null()).spawn().unwrap());
         assert!(
-            wait_until(10, || self
-                .log_text()
-                .contains(&format!("as node {}", self.id))),
+            wait_until(10, || self.log_text().matches(&started).count() > before),
             "{} never started:\n{}",
             self.name,
             self.log_text()
