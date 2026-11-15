@@ -1,20 +1,17 @@
 # P2P vault sync — design
 
-Status: draft for Sam's review · Priority `!v6bJRp82DfyJ6OKzVaM6fLFU2oojPQBFA49e9zRAWCE/e6f37d2e`
-Brainstormed with Sam over iMessage, 11/15. Security check: Knightwatch.
+Status: draft for Sam's review · Security check: Knightwatch.
 Product stage: **internal tool** (Sam's own machines first), built clean enough to open up later.
 
 ## Intent
 
-Sam's agents run on several machines (the MacBook Air, the MacBook Pro, wakeup on Linux,
-the Raspberry Pis). He wants them to share **one Obsidian-style knowledge base** — a folder
-of Markdown notes, today `~/Plow/wiki` on the Air — that every agent on every machine can read
+Sam's agents run on several machines (Macs, a Linux server, Raspberry Pis). He wants them to share **one Obsidian-style knowledge base** — a folder
+of Markdown notes, today on one Mac — that every agent on every machine can read
 and write, kept in sync directly between the machines, end-to-end encrypted, with full edit
 history and rollback.
 
-Today the wiki lives only on the Air (318 files, 6.8 MB, 286 `.md`), its history in
-`~/Plow/wiki.git` (pushed to GitHub as a snapshot). 128 of its last 130 commits are agents
-(cos, str); one is Sam. Nothing syncs it to other machines.
+Today the wiki lives only on that Mac, with its history in a git repository beside it, and
+most of its commits come from agents. Nothing syncs it to other machines.
 
 ## Goals
 
@@ -31,7 +28,7 @@ Today the wiki lives only on the Air (318 files, 6.8 MB, 286 `.md`), its history
 - A GUI or Mac App Store app (later; build so it stays possible).
 - Real-time co-editing (Dropbox Paper / CRDT style).
 - Windows.
-- Replacing the existing GitHub snapshot push of Sam's wiki — it stays as an off-site backup.
+- Replacing the wiki's existing off-site git backup — it stays.
 
 ## Anti-goals (failure even if it "works")
 
@@ -80,7 +77,7 @@ Today the wiki lives only on the Air (318 files, 6.8 MB, 286 `.md`), its history
   new one"; with per-device keys and a pinned member list, the existing machine instead adds
   the newcomer's node ID to the list and every member then trusts it. Same effect, nothing
   secret to copy, and revocation is just removal.
-- The vault folder stays clean: the git directory lives beside it (as `~/Plow/wiki.git` does
+- The vault folder stays clean: the git directory lives beside it (as the wiki's history does
   today), so editors and agents never see `.git`.
 - Commits carry the machine name, and the writing agent's name when the tool can tell.
 - Sync is continuous: a file watcher with a short debounce, plus a periodic catch-up with
@@ -114,10 +111,10 @@ Today the wiki lives only on the Air (318 files, 6.8 MB, 286 `.md`), its history
   back only if it is unchanged since the merge began; otherwise the new edit is committed and
   merged again. One sync operation runs at a time, and an interrupted one resumes cleanly
   after a restart. (Audit Important 1.)
-- **The GitHub snapshot is a trusted-content exception.** It stores Sam's notes on a private
-  GitHub repo, as it does today; the end-to-end claim covers the sync itself. (Audit Important 5.)
+- **The off-site backup is a trusted-content exception.** It stores the notes outside the
+  vault, as it does today; the end-to-end claim covers the sync itself. (Audit Important 5.)
 - **A joining machine gets the vault at the same path as the machine that invited it**
-  (`~/Plow/wiki` for Sam), overridable by a flag. If that folder already has files or git
+  overridable by a flag. If that folder already has files or git
   history, the installer stops and says so rather than merging or overwriting.
 
 ## Prior art we lean on (search 11/15)
@@ -170,7 +167,7 @@ Done when: a third machine joins with a fresh code and receives the full vault a
 ### Chunk 4: install.sh, release builds, user service
 Implements: §Decided with Sam (install.sh), §Builder's calls (user service)
 Interfaces: consumes Chunks 1–3's binary · produces release artifacts per OS/arch and an `install.sh` that takes a join code
-Done when: `install.sh` installs, starts the service and joins on the MacBook Air, MacBook Pro, wakeup and one Raspberry Pi; the service survives a reboot on one macOS and one Linux machine.
+Done when: `install.sh` installs, starts the service and joins on two Macs, the Linux server and one Raspberry Pi; the service survives a reboot on one macOS and one Linux machine.
 
 ### Chunk 5: The Plow join page
 Implements: §Decided with Sam (Plow link, code after `#`)
@@ -178,6 +175,6 @@ Interfaces: consumes Chunk 4's `install.sh` · produces a `plow.co/sync` page th
 Done when: opening a `plow.co/sync#<code>` link shows the right command; the server's access logs for that request contain no code.
 
 ### Chunk 6: Move Sam's wiki onto it
-Implements: §Intent, §Anti-goals (history kept), §Non-goals (GitHub snapshot stays)
+Implements: §Intent, §Anti-goals (history kept), §Non-goals (off-site backup stays)
 Interfaces: consumes Chunks 1–5
-Done when: the Air's `~/Plow/wiki` is the vault's first member with all existing history intact (refs and commit ids recorded before the move match after it); wakeup and the MacBook Pro have joined; an agent on wakeup writes a note that an agent on the Air then reads; the GitHub snapshot push still runs.
+Done when: the wiki's current Mac is the vault's first member with all existing history intact (refs and commit ids recorded before the move match after it); the Linux server and another Mac have joined; an agent on the Linux server writes a note that an agent on the first Mac then reads; the off-site backup still runs.
