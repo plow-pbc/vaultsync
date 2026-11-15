@@ -120,7 +120,7 @@ impl Vault {
         let attributes = self.git.git_dir.join("info").join("attributes");
         let existing = fs::read_to_string(&attributes).unwrap_or_default();
         let mut rule = format!("{MEMBERS_PATH} merge=union\n");
-        if !existing.contains(&rule) {
+        if !existing.lines().any(|line| line == rule.trim_end()) {
             if !existing.is_empty() && !existing.ends_with('\n') {
                 rule.insert(0, '\n');
             }
