@@ -12,8 +12,7 @@
 #       stop and remove the service; the binary and the vault stay
 set -eu
 
-REPO=plow-pbc/vaultsync
-BASE=${VAULTSYNC_DOWNLOAD:-https://github.com/$REPO/releases/latest/download}
+BASE=${VAULTSYNC_DOWNLOAD:-https://github.com/plow-pbc/vaultsync/releases/latest/download}
 BIN_DIR=${VAULTSYNC_BIN_DIR:-$HOME/.local/bin}
 BIN=$BIN_DIR/vaultsync
 NAME=vaultsync
@@ -72,11 +71,9 @@ say "Downloading vaultsync for $target"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 asset=vaultsync-$target.tar.gz
-if ! curl -fsSL "$BASE/$asset" -o "$tmp/$asset" || ! curl -fsSL "$BASE/$asset.sha256" -o "$tmp/$asset.sha256"; then
-    # A private repository: fetch through an authenticated gh instead.
-    command -v gh >/dev/null || die "could not download $BASE/$asset"
-    gh release download --repo "$REPO" --pattern "$asset*" --dir "$tmp" --clobber
-fi
+for f in "$asset" "$asset.sha256"; do
+    curl -fsSL "$BASE/$f" -o "$tmp/$f" || die "could not download $BASE/$f"
+done
 if command -v sha256sum >/dev/null; then
     (cd "$tmp" && sha256sum -c "$asset.sha256" >/dev/null) || die "checksum mismatch for $asset"
 else

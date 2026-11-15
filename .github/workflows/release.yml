@@ -6,6 +6,9 @@ on:
   pull_request:
     paths: ['.github/workflows/release.yml', 'install.sh']
 
+permissions:
+  contents: read
+
 jobs:
   build:
     strategy:
