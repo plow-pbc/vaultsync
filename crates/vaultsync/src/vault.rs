@@ -207,7 +207,14 @@ impl Vault {
             "--exclude-standard",
         ])?;
         let ignored: Vec<&str> = ignored.split('\0').filter(|f| !f.is_empty()).collect();
-        let clash: Vec<&str> = added.split('\0').filter(|f| ignored.contains(f)).collect();
+        // The same path, or one inside the other (a file where a folder was).
+        let overlaps = |a: &str, b: &str| {
+            a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+        };
+        let clash: Vec<&str> = added
+            .split('\0')
+            .filter(|f| !f.is_empty() && ignored.iter().any(|i| overlaps(f, i)))
+            .collect();
         if !clash.is_empty() {
             bail!(
                 "rollback would overwrite untracked files: {}; move them aside",

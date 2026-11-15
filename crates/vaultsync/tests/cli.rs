@@ -221,38 +221,42 @@ fn failed_auto_commit_is_retried_without_another_edit() {
 
 #[test]
 fn rollback_never_overwrites_a_file_it_does_not_track() {
-    let tmp = tempfile::tempdir().unwrap();
-    let folder = tmp.path().join("notes");
-    fs::create_dir(&folder).unwrap();
-    fs::write(folder.join("draft.tmp"), "old tracked draft\n").unwrap();
-    init(&folder);
-    let first = ok(&folder, &["log"])
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_owned();
-    // Later the draft is untracked and ignored, and someone keeps a local copy.
-    let (gd, wt) = (
-        format!("--git-dir={}", git_dir(&folder).display()),
-        format!("--work-tree={}", folder.display()),
-    );
-    fs::write(folder.join(".gitignore"), "*.tmp\n").unwrap();
-    git(&folder, &[&gd, &wt, "rm", "-q", "--cached", "draft.tmp"]);
-    git(&folder, &[&gd, &wt, "add", ".gitignore"]);
-    git(&folder, &[&gd, &wt, "commit", "-qm", "ignore drafts"]);
-    fs::write(folder.join("draft.tmp"), "local scratch\n").unwrap();
+    // (tracked once, ignored local file that now sits in its place)
+    for (old, local) in [("draft.tmp", "draft.tmp"), ("drafts", "drafts/scratch.tmp")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("notes");
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join(old), "old tracked draft\n").unwrap();
+        init(&folder);
+        let first = ok(&folder, &["log"])
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned();
+        // Later it is untracked, drafts are ignored, and someone keeps a local one.
+        let (gd, wt) = (
+            format!("--git-dir={}", git_dir(&folder).display()),
+            format!("--work-tree={}", folder.display()),
+        );
+        fs::write(folder.join(".gitignore"), "*.tmp\n").unwrap();
+        git(&folder, &[&gd, &wt, "rm", "-q", old]);
+        git(&folder, &[&gd, &wt, "add", ".gitignore"]);
+        git(&folder, &[&gd, &wt, "commit", "-qm", "ignore drafts"]);
+        fs::create_dir_all(folder.join(local).parent().unwrap()).unwrap();
+        fs::write(folder.join(local), "local scratch\n").unwrap();
 
-    let out = vaultsync(&folder, &["rollback", &first]);
+        let out = vaultsync(&folder, &["rollback", &first]);
 
-    assert!(!out.status.success(), "rollback must refuse");
-    assert_eq!(
-        fs::read_to_string(folder.join("draft.tmp")).unwrap(),
-        "local scratch\n"
-    );
-    assert!(
-        folder.join(".gitignore").exists(),
-        "nothing restored halfway"
-    );
+        assert!(!out.status.success(), "{local}: rollback must refuse");
+        assert_eq!(
+            fs::read_to_string(folder.join(local)).unwrap(),
+            "local scratch\n"
+        );
+        assert!(
+            folder.join(".gitignore").exists(),
+            "{local}: nothing restored halfway"
+        );
+    }
 }
 
 #[test]
