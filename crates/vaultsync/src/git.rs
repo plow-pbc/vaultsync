@@ -24,14 +24,11 @@ impl Git {
             .args(["-c", "commit.gpgsign=false", "-c", "core.quotepath=false"])
             .args(args)
             .current_dir(&self.work_tree);
-        // Inherited from a parent git process, these would point git at other storage.
-        for var in [
-            "GIT_INDEX_FILE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_COMMON_DIR",
-        ] {
-            cmd.env_remove(var);
+        // Inherited from a parent git process (a hook, say), these would point git elsewhere.
+        for (var, _) in std::env::vars_os() {
+            if var.to_string_lossy().starts_with("GIT_") {
+                cmd.env_remove(var);
+            }
         }
         cmd
     }
