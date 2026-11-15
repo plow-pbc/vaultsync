@@ -258,14 +258,18 @@ fn rollback_never_changes_the_member_list() {
     );
 
     // Nor when the selection takes it in.
-    for path in [".vault/members", "."] {
-        let _ = vaultsync(&m0.folder, &["rollback", &start, path]);
-        let after = m0.read(".vault/members").unwrap();
-        assert!(
-            after.contains(&format!("removed {} gone", gone.id)),
-            "{path}: {after}"
-        );
-    }
+    let members = m0.read(".vault/members").unwrap();
+    m0.write("later.md", "rolled away\n");
+    ok(&m0.folder, &["rollback", &start, "."]);
+    assert_eq!(
+        m0.read("later.md"),
+        None,
+        "the rest of the selection is restored"
+    );
+    assert_eq!(m0.read(".vault/members").unwrap(), members);
+    let direct = vaultsync(&m0.folder, &["rollback", &start, ".vault/members"]);
+    assert!(String::from_utf8_lossy(&direct.stderr).contains("already matches"));
+    assert_eq!(m0.read(".vault/members").unwrap(), members);
 }
 
 #[test]
@@ -287,7 +291,9 @@ fn a_fetch_that_began_before_a_removal_gets_nothing_after_it() {
     ok(&mesh.nodes[0].folder, &["remove", "m1"]);
     mesh.nodes[0].write("secret.md", "after m1 was removed\n");
 
-    std::thread::sleep(Duration::from_secs(8));
+    // The held request resumes, is turned away, and nothing reached m1.
+    let turned_away = || mesh.nodes[0].log_text().contains("is no longer a member");
+    assert!(wait_until(15, turned_away), "{}", mesh.logs());
     assert_eq!(mesh.nodes[1].read("secret.md"), None, "{}", mesh.logs());
     // Not even its contents reached m1's history.
     let gd0 = format!("--git-dir={}.git", mesh.nodes[0].folder.display());
