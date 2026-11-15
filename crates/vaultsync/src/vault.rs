@@ -616,6 +616,16 @@ impl Vault {
         self.git.run(["update-ref", "-d", name]).map(drop)
     }
 
+    /// Drops pins a crashed or cancelled request left behind.
+    pub fn unpin_all(&self) -> Result<()> {
+        let pins = self.git.run([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/vaultsync/serving",
+        ])?;
+        pins.lines().try_for_each(|name| self.unpin(name))
+    }
+
     /// The one ref a peer's bundle carries.
     fn bundle_ref(&self, bundle: &Path) -> Result<String> {
         let mut cmd = self.git.command(["bundle", "list-heads"]);

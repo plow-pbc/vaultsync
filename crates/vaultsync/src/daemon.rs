@@ -27,6 +27,7 @@ pub fn run(vault: Vault, opts: Opts) -> Result<()> {
 }
 
 async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
+    vault.unpin_all()?;
     let net = Net::bind(vault.secret_key()?, opts.addr_dir.as_deref()).await?;
     let (events, mut rx) = mpsc::unbounded_channel();
 
