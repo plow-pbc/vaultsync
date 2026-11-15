@@ -663,3 +663,23 @@ fn a_rename_made_while_a_sync_lands_is_kept() {
         );
     }
 }
+
+#[test]
+fn a_restarted_machine_s_edits_reach_its_peers_promptly() {
+    let mut mesh = Mesh::new(2);
+    mesh.start_all();
+    mesh.converged(20);
+    // Catching up every second, the peer is usually mid-request to the old
+    // instance when it dies.
+    for round in 0..3 {
+        mesh.nodes[0].stop();
+        mesh.start(0);
+        let text = format!("after restart {round}\n");
+        mesh.nodes[0].write("a.md", &text);
+        assert!(
+            wait_until(15, || mesh.nodes[1].read("a.md").as_deref() == Some(&text)),
+            "restart {round}: the edit took over 15 s:\n{}",
+            mesh.logs()
+        );
+    }
+}

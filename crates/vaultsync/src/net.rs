@@ -12,7 +12,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use iroh::endpoint::{Connection, Incoming, presets};
+use iroh::endpoint::{Connection, Incoming, QuicTransportConfig, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::UnboundedSender;
@@ -34,6 +34,10 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest a fetch's transfer may take.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
+/// How long a silent connection is believed: two of iroh's 5 s keep-alives.
+/// A restarted peer is unreachable while a connection to its dead instance
+/// lingers, since iroh sends new dials down that connection's path.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What the daemon reacts to.
 pub enum Event {
@@ -55,9 +59,13 @@ pub struct Net {
 
 impl Net {
     pub async fn bind(key: SecretKey, addr_dir: Option<&Path>) -> Result<Net> {
+        let transport = QuicTransportConfig::builder()
+            .max_idle_timeout(Some(IDLE_TIMEOUT.try_into()?))
+            .build();
         let endpoint = match addr_dir {
             None => {
                 let endpoint = Endpoint::builder(presets::N0)
+                    .transport_config(transport)
                     .secret_key(key)
                     .alpns(vec![ALPN.to_vec()])
                     .bind()
@@ -72,6 +80,7 @@ impl Net {
             }
             Some(dir) => {
                 let endpoint = Endpoint::builder(presets::Minimal)
+                    .transport_config(transport)
                     .secret_key(key)
                     .alpns(vec![ALPN.to_vec()])
                     .relay_mode(RelayMode::Disabled)
