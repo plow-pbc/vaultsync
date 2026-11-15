@@ -236,7 +236,17 @@ impl Vault {
         if fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
             return self.git.value(["rev-parse", "--short", "HEAD"]);
         }
-        fs::create_dir_all(path.parent().expect("has a parent"))?;
+        let dir = path.parent().expect("has a parent");
+        // Never write through a symlink a synced commit put there.
+        for p in [dir, &path] {
+            if fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+                bail!(
+                    "{} is a symlink; refusing to write the member list through it",
+                    p.display()
+                );
+            }
+        }
+        fs::create_dir_all(dir)?;
         fs::write(&path, text)?;
         self.git.run(["add", MEMBERS_PATH])?;
         self.commit(subject)
@@ -591,16 +601,14 @@ impl Vault {
         ))
     }
 
-    /// Stores a peer's head from its bundle. True if it moved.
-    pub fn receive(&self, peer: &EndpointId, bundle: &Path) -> Result<bool> {
+    /// Stores a peer's head from its bundle.
+    pub fn receive(&self, peer: &EndpointId, bundle: &Path) -> Result<()> {
         let name = peer_ref(peer);
-        let before = self.git.value(["rev-parse", "-q", "--verify", &name]).ok();
         let mut cmd = self.git.command(["fetch", "-q", "--no-write-fetch-head"]);
         cmd.arg(bundle).arg(format!("+HEAD:{name}"));
         let fetched = exec(cmd);
         fs::remove_file(bundle)?;
-        fetched?;
-        Ok(self.git.value(["rev-parse", &name]).ok() != before)
+        fetched.map(drop)
     }
 
     /// Brings a peer's head into this vault: fast-forward, or a merge. Pending
@@ -658,6 +666,16 @@ impl Vault {
     /// git would change was edited meanwhile; nothing is touched then. The
     /// intent file records how far it got, for `recover`.
     fn apply(&self, old: &str, new: &str) -> Result<bool> {
+        if hooked("pause-before-apply") {
+            eprintln!("test hook: pausing before apply");
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        // git's check below treats a deleted tracked file as clean and would
+        // write it back, so a rename made since the checkpoint would leave
+        // both names. Any tracked change since then: commit it and merge again.
+        if self.git.run(["diff", "--quiet"]).is_err() {
+            return Ok(false);
+        }
         let intent = self.state("apply")?;
         fs::write(&intent, format!("started {old} {new}\n"))?;
         crash_if_hooked("crash-before-worktree");
