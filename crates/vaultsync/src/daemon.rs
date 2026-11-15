@@ -9,6 +9,7 @@ use iroh::EndpointId;
 use notify_debouncer_mini::{DebounceEventResult, new_debouncer, notify::RecursiveMode};
 use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
+use tokio::time::Instant;
 
 use crate::net::{Event, Net};
 use crate::vault::Vault;
@@ -51,19 +52,26 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
 
     // Catch edits made while nothing was watching.
     let mut retry = Retry::default();
-    edited(&vault, &net, &mut retry, &events).await;
+    edited(&vault, &net, &mut retry).await;
     eprintln!(
         "watching {} as node {}",
         vault.folder().display(),
         vault.node_id()?
     );
-    while let Some(event) = rx.recv().await {
+    loop {
+        // A failed commit is tried again at its deadline, edits or not.
+        let deadline = retry
+            .at
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+        let event = tokio::select! {
+            event = rx.recv() => match event {
+                Some(event) => event,
+                None => break,
+            },
+            _ = tokio::time::sleep_until(deadline), if retry.at.is_some() => Event::Edited,
+        };
         match event {
-            Event::Edited => edited(&vault, &net, &mut retry, &events).await,
-            Event::RetryCommit => {
-                retry.timer = None;
-                edited(&vault, &net, &mut retry, &events).await;
-            }
+            Event::Edited => edited(&vault, &net, &mut retry).await,
             Event::Poke(peer) => sync_with(&vault, &net, peer).await,
             Event::CatchUp => {
                 for peer in blocking(&vault, Vault::peers).await.unwrap_or_default() {
@@ -83,27 +91,18 @@ async fn blocking<T: Send + 'static>(
     spawn_blocking(move || f(&vault)).await?
 }
 
-/// Backoff for a commit that failed: at most one retry timer at a time.
+/// When to try a failed commit again, backing off 1 s doubling to a minute.
 #[derive(Default)]
 struct Retry {
     wait: Option<Duration>,
-    timer: Option<tokio::task::JoinHandle<()>>,
+    at: Option<Instant>,
 }
 
-/// Commits pending edits. On failure, schedules another try (1 s doubling
-/// to a minute) so the edit lands even if no other edit follows.
-async fn edited(
-    vault: &Vault,
-    net: &Net,
-    retry: &mut Retry,
-    events: &mpsc::UnboundedSender<Event>,
-) {
+/// Commits pending edits; on failure sets the next retry deadline.
+async fn edited(vault: &Vault, net: &Net, retry: &mut Retry) {
     match blocking(vault, Vault::commit_pending).await {
         Ok(id) => {
-            retry.wait = None;
-            if let Some(timer) = retry.timer.take() {
-                timer.abort();
-            }
+            *retry = Retry::default();
             if let Some(id) = id {
                 eprintln!("committed {id}");
                 poke_all(vault, net).await;
@@ -113,15 +112,11 @@ async fn edited(
             let wait = retry.wait.map_or(Duration::from_secs(1), |w| {
                 (w * 2).min(Duration::from_secs(60))
             });
-            retry.wait = Some(wait);
+            *retry = Retry {
+                wait: Some(wait),
+                at: Some(Instant::now() + wait),
+            };
             eprintln!("commit failed, retrying in {}s: {e:#}", wait.as_secs());
-            if retry.timer.is_none() {
-                let events = events.clone();
-                retry.timer = Some(tokio::spawn(async move {
-                    tokio::time::sleep(wait).await;
-                    let _ = events.send(Event::RetryCommit);
-                }));
-            }
         }
     }
 }

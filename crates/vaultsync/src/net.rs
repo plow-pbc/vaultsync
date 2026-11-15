@@ -33,8 +33,6 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// What the daemon reacts to.
 pub enum Event {
     Edited,
-    /// Time to try a failed commit again.
-    RetryCommit,
     /// A peer has new commits.
     Poke(EndpointId),
     CatchUp,
