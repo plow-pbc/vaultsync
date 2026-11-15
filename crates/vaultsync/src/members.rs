@@ -154,10 +154,14 @@ pub fn validate(git: &Git, head: &str, tip: &str, trusted: &Members) -> Result<(
         }
         let signed_by = signer(git, commit)?;
         match parents.first().map(|p| at_cached(p)).transpose()?.flatten() {
-            // History from before the vault had a member list.
+            // No member list at its parent: a root, or history from before the
+            // vault had one. Only a current member may bring that in; a removed
+            // machine could otherwise start a fresh, unsigned line of history.
             None => {
-                if ours.is_some() && !signed_by.is_some_and(|id| trusted.contains(&id)) {
-                    bail!("commit {commit} starts a member list without a trusted signature");
+                if !signed_by.is_some_and(|id| trusted.contains(&id)) {
+                    bail!(
+                        "commit {commit} has no member list behind it and no current member's signature"
+                    );
                 }
             }
             Some(before) => {

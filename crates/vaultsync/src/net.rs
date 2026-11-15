@@ -242,8 +242,16 @@ async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>
                 .lines()
                 .map(str::to_owned)
                 .collect();
+            if crate::vault::hooked("pause-before-bundle") {
+                eprintln!("test hook: pausing before the bundle");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
             let v = vault.clone();
             let (present, news) = spawn_blocking(move || {
+                // Removed since the request began? Then it gets nothing.
+                if !v.members()?.contains(&peer) {
+                    bail!("{} is no longer a member", peer.fmt_short());
+                }
                 let present = v.present(&haves)?;
                 let news = v.has_news(&present)?;
                 anyhow::Ok((present, news))
