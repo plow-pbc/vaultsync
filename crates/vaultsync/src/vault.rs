@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -275,16 +275,27 @@ impl Vault {
 
     /// An empty vault for a machine about to join: no commits yet. Refuses a
     /// folder that already has files or history beside it.
-    pub fn for_join(folder: &Path, machine: Option<String>) -> Result<Vault> {
-        let has_files = fs::read_dir(folder).is_ok_and(|mut entries| entries.next().is_some());
-        if has_files || git_dir_for(folder).exists() {
+    pub fn for_join(folder: &Path, machine: Option<String>) -> Result<(Vault, bool)> {
+        // Resolve `.` and symlinks first, so the history beside the folder is
+        // checked where it really is.
+        let folder = std::path::absolute(folder)?;
+        let (Some(parent), Some(name)) = (folder.parent(), folder.file_name()) else {
+            bail!("{} can't hold a vault", folder.display());
+        };
+        fs::create_dir_all(parent)?;
+        let folder = folder
+            .canonicalize()
+            .or_else(|_| parent.canonicalize().map(|p| p.join(name)))?;
+        let has_files = fs::read_dir(&folder).is_ok_and(|mut entries| entries.next().is_some());
+        if has_files || git_dir_for(&folder).exists() {
             bail!(
                 "{} already has files or history; join into an empty or new folder (--folder)",
                 folder.display()
             );
         }
-        fs::create_dir_all(folder)?;
-        let vault = Vault::at(folder.canonicalize()?);
+        let created = !folder.exists();
+        fs::create_dir_all(&folder)?;
+        let vault = Vault::at(folder);
         vault.git.run(["init", "-q", "-b", "main"])?;
         let machine = match machine {
             Some(m) => m,
@@ -292,7 +303,7 @@ impl Vault {
         };
         vault.git.run(["config", MACHINE_KEY, &machine])?;
         vault.ensure_union_merge()?;
-        Ok(vault)
+        Ok((vault, created))
     }
 
     /// Takes the inviter's full history from its bundle and fills the folder.
@@ -308,9 +319,33 @@ impl Vault {
     }
 
     /// Removes a vault [`for_join`](Self::for_join) made, after a failed join.
-    pub fn discard(self) -> Result<()> {
+    pub fn discard(self, created_folder: bool) -> Result<()> {
+        // Only what join wrote: files checked out and still as checked out,
+        // their emptied folders, the history beside, and the folder if join
+        // made it and nothing else landed there meanwhile.
+        let listed = self.git.run(["ls-files", "-z"]).unwrap_or_default();
+        let changed = self
+            .git
+            .run(["ls-files", "-z", "--modified"])
+            .unwrap_or_default();
+        let changed: Vec<&str> = changed.split('\0').collect();
+        for path in listed
+            .split('\0')
+            .filter(|p| !p.is_empty() && !changed.contains(p))
+        {
+            let file = self.folder().join(path);
+            if fs::remove_file(&file).is_ok() {
+                for dir in file.ancestors().skip(1).take_while(|d| *d != self.folder()) {
+                    if fs::remove_dir(dir).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
         fs::remove_dir_all(&self.git.git_dir)?;
-        fs::remove_dir_all(self.folder())?;
+        if created_folder {
+            let _ = fs::remove_dir(self.folder());
+        }
         Ok(())
     }
 
@@ -411,12 +446,28 @@ impl Vault {
             .value(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])?;
         let short = self.git.value(["rev-parse", "--short", &id])?;
         self.commit_pending_locked()?;
+        let members = Path::new(MEMBERS_PATH);
         let (tree, what) = match path {
+            // A rollback never undoes a membership change: the list stays as it is now.
+            None if self.has(&id, members) || self.has("HEAD", members) => {
+                (self.tree_with(&id, "HEAD", members)?, "vault".to_owned())
+            }
             None => (
                 self.git.value(["rev-parse", &format!("{id}^{{tree}}")])?,
                 "vault".to_owned(),
             ),
-            Some(path) => (self.tree_with(&id, path)?, path.display().to_string()),
+            Some(path)
+                if path
+                    .components()
+                    .find(|c| matches!(c, Component::Normal(_)))
+                    == Some(Component::Normal(".vault".as_ref())) =>
+            {
+                bail!("the member list changes only through `member add` and `remove`")
+            }
+            Some(path) => (
+                self.tree_with("HEAD", &id, path)?,
+                path.display().to_string(),
+            ),
         };
         // Git overwrites ignored files freely; refuse instead.
         let added = self.git.run([
@@ -467,7 +518,13 @@ impl Vault {
 
     /// HEAD's tree with `path` as it was at `id` (absent if it was absent),
     /// built in a scratch index so the real one is untouched.
-    fn tree_with(&self, id: &str, path: &Path) -> Result<String> {
+    fn has(&self, rev: &str, path: &Path) -> bool {
+        self.git
+            .run(["cat-file", "-e", &format!("{rev}:{}", path.display())])
+            .is_ok()
+    }
+
+    fn tree_with(&self, base: &str, id: &str, path: &Path) -> Result<String> {
         let index = self.git.git_dir.join("vaultsync-rollback-index");
         let with_index = |args: &[&OsStr]| {
             let mut cmd = self.git.command(args);
@@ -475,7 +532,7 @@ impl Vault {
             exec(cmd)
         };
         let source = format!("--source={id}");
-        with_index(&["read-tree".as_ref(), "HEAD".as_ref()])?;
+        with_index(&["read-tree".as_ref(), base.as_ref()])?;
         with_index(&[
             "restore".as_ref(),
             "--staged".as_ref(),
