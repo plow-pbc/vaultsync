@@ -1,11 +1,12 @@
 //! The vault's member list (`.vault/members`) and the signatures that make
-//! changes to it count.
+//! commits count.
 //!
 //! Every commit this tool makes carries `Vault-Signature: <node id> <sig>`, an
 //! ed25519 signature by the machine's node key over the commit's tree and
-//! parents. A commit arriving from a peer that changes the member list is
+//! parents. Once a vault has a member list, a commit arriving from a peer is
 //! accepted only if a member at its parent signed it; a merge may only combine
-//! its parents' lists.
+//! its parents' lists. A removed machine stays removed: its tombstone
+//! (`removed <id> <name>`) outranks any line listing it, and never goes away.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -16,28 +17,54 @@ use crate::git::Git;
 
 pub const MEMBERS_PATH: &str = ".vault/members";
 const TRAILER: &str = "Vault-Signature:";
+const REMOVED: &str = "removed ";
 
-/// Node id → machine name.
-pub type Members = BTreeMap<EndpointId, String>;
+/// Node id → machine name, for listed and for removed machines.
+#[derive(Clone, Default)]
+pub struct Members {
+    pub listed: BTreeMap<EndpointId, String>,
+    pub removed: BTreeMap<EndpointId, String>,
+}
+
+impl Members {
+    /// Listed and not removed: removal wins when a merge keeps both lines.
+    pub fn contains(&self, id: &EndpointId) -> bool {
+        self.listed.contains_key(id) && !self.removed.contains_key(id)
+    }
+
+    pub fn active(&self) -> impl Iterator<Item = (&EndpointId, &String)> {
+        self.listed
+            .iter()
+            .filter(|(id, _)| !self.removed.contains_key(*id))
+    }
+}
 
 pub fn parse(text: &str) -> Result<Members> {
-    text.lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|line| {
-            let (id, name) = line.split_once(' ').unwrap_or((line, ""));
-            let id = id
-                .parse()
-                .with_context(|| format!("bad member line: {line}"))?;
-            Ok((id, name.trim().to_owned()))
-        })
-        .collect()
+    let mut members = Members::default();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let (map, entry) = match line.strip_prefix(REMOVED) {
+            Some(rest) => (&mut members.removed, rest),
+            None => (&mut members.listed, line),
+        };
+        let (id, name) = entry.split_once(' ').unwrap_or((entry, ""));
+        let id = id
+            .parse()
+            .with_context(|| format!("bad member line: {line}"))?;
+        map.insert(id, name.trim().to_owned());
+    }
+    Ok(members)
 }
 
 pub fn format(members: &Members) -> String {
-    members
+    let listed = members
+        .listed
         .iter()
-        .map(|(id, name)| format!("{id} {name}\n"))
-        .collect()
+        .map(|(id, name)| format!("{id} {name}\n"));
+    let removed = members
+        .removed
+        .iter()
+        .map(|(id, name)| format!("{REMOVED}{id} {name}\n"));
+    listed.chain(removed).collect()
 }
 
 /// The member list in `rev`'s tree, if it has one.
@@ -101,47 +128,54 @@ fn signer(git: &Git, commit: &str) -> Result<Option<EndpointId>> {
 /// had none.
 pub fn validate(git: &Git, head: &str, tip: &str, trusted: &Members) -> Result<()> {
     let graph = git.run(["rev-list", "--parents", tip, "--not", head])?;
-    let commits: Vec<Vec<&str>> = graph.lines().map(|l| l.split(' ').collect()).collect();
-    // Blob id of each commit's member list, in one batch.
-    let wanted: BTreeSet<&str> = commits.iter().flatten().copied().collect();
-    let query: String = wanted
-        .iter()
-        .map(|c| format!("{c}:{MEMBERS_PATH}\n"))
-        .collect();
-    let answers = git.run_stdin(["cat-file", "--batch-check=%(objectname)"], &query)?;
-    let blob: HashMap<&str, Option<&str>> = wanted
-        .iter()
-        .zip(answers.lines())
-        .map(|(c, a)| (*c, (!a.ends_with(" missing")).then_some(a)))
-        .collect();
-
-    for line in &commits {
+    let mut lists: HashMap<String, Option<Members>> = HashMap::new();
+    let mut at_cached = |rev: &str| -> Result<Option<Members>> {
+        if !lists.contains_key(rev) {
+            lists.insert(rev.to_owned(), at(git, rev)?);
+        }
+        Ok(lists[rev].clone())
+    };
+    for line in graph.lines() {
+        let line: Vec<&str> = line.split(' ').collect();
         let (commit, parents) = (line[0], &line[1..]);
-        // A merge carries exactly the members of both sides, signed or not.
+        let ours = at_cached(commit)?;
+        // A merge carries exactly what both sides listed and removed, signed or not.
         if parents.len() > 1 {
-            let mut union = BTreeSet::new();
+            let (mut listed, mut removed) = (BTreeSet::new(), BTreeSet::new());
             for p in parents {
-                union.extend(at(git, p)?.unwrap_or_default().into_keys());
+                let theirs = at_cached(p)?.unwrap_or_default();
+                listed.extend(theirs.listed.into_keys());
+                removed.extend(theirs.removed.into_keys());
             }
-            let ours: BTreeSet<_> = at(git, commit)?.unwrap_or_default().into_keys().collect();
-            if ours != union {
+            let ours = ours.unwrap_or_default();
+            if ours.listed.into_keys().collect::<BTreeSet<_>>() != listed
+                || ours.removed.into_keys().collect::<BTreeSet<_>>() != removed
+            {
                 bail!("merge {commit} does not keep exactly its parents' members");
             }
             continue;
         }
-        if parents
-            .first()
-            .map_or(blob[commit].is_none(), |p| blob[p] == blob[commit])
-        {
-            continue;
-        }
-        let allowed = match parents.first() {
-            Some(p) => at(git, p)?.unwrap_or_else(|| trusted.clone()),
-            None => trusted.clone(),
-        };
-        match signer(git, commit)? {
-            Some(id) if allowed.contains_key(&id) => {}
-            _ => bail!("commit {commit} changes the member list without a member's signature"),
+        let signed_by = signer(git, commit)?;
+        match parents.first().map(|p| at_cached(p)).transpose()?.flatten() {
+            // History from before the vault had a member list.
+            None => {
+                if ours.is_some() && !signed_by.is_some_and(|id| trusted.contains(&id)) {
+                    bail!("commit {commit} starts a member list without a trusted signature");
+                }
+            }
+            Some(before) => {
+                if !signed_by.is_some_and(|id| before.contains(&id)) {
+                    bail!("commit {commit} is not signed by a member");
+                }
+                let after = ours.unwrap_or_default();
+                if !before
+                    .removed
+                    .keys()
+                    .all(|id| after.removed.contains_key(id))
+                {
+                    bail!("commit {commit} brings back a removed member");
+                }
+            }
         }
     }
     Ok(())
