@@ -677,16 +677,16 @@ impl Vault {
         else {
             return Ok(None);
         };
-        // History straight from a peer removed meanwhile counts for nothing;
-        // what a current member relays is judged commit by commit.
-        if !self.members()?.contains(peer) {
-            bail!(
-                "refusing history from {}: no longer a member",
-                peer.fmt_short()
-            );
-        }
         for _ in 0..APPLY_TRIES {
             self.commit_pending_locked()?;
+            // History straight from a peer removed meanwhile counts for nothing;
+            // what a current member relays is judged commit by commit.
+            if !self.members()?.contains(peer) {
+                bail!(
+                    "refusing history from {}: no longer a member",
+                    peer.fmt_short()
+                );
+            }
             let head = self.head()?;
             if self.is_ancestor(&tip, &head) {
                 return Ok(None);

@@ -8,7 +8,7 @@
 //! deterministic merge of its parents. A removed machine stays removed: its tombstone
 //! (`removed <id> <name>`) outranks any line listing it, and never goes away.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use iroh::{EndpointId, SecretKey, Signature};
@@ -154,8 +154,8 @@ pub fn validate(git: &Git, head: &str, tip: &str, trusted: &Members) -> Result<(
             introductions.push(commit);
         }
     }
-    let vouched: Vec<String> = if introductions.is_empty() {
-        Vec::new()
+    let vouched: HashSet<String> = if introductions.is_empty() {
+        HashSet::new()
     } else {
         let mut args = vec!["rev-list"];
         args.extend(&introductions);
@@ -185,9 +185,7 @@ pub fn validate(git: &Git, head: &str, tip: &str, trusted: &Members) -> Result<(
             // it or the commit that starts the list on top of it; a removed
             // machine could otherwise start a fresh, unsigned line of history.
             None => {
-                if !signed_by.is_some_and(|id| trusted.contains(&id))
-                    && !vouched.iter().any(|v| v == commit)
-                {
+                if !signed_by.is_some_and(|id| trusted.contains(&id)) && !vouched.contains(commit) {
                     bail!(
                         "commit {commit} has no member list behind it and no current member's signature"
                     );
