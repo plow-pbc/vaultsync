@@ -3,6 +3,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use iroh::{EndpointId, SecretKey};
@@ -403,7 +404,14 @@ impl Vault {
 
     /// Path for a bundle arriving from `peer`.
     pub fn incoming(&self, peer: &EndpointId) -> Result<PathBuf> {
-        self.state(&format!("incoming-{}.bundle", peer.fmt_short()))
+        // A fresh name per attempt: no two transfers ever share a file.
+        static ATTEMPT: AtomicU64 = AtomicU64::new(0);
+        let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        self.state(&format!(
+            "incoming-{}-{pid}-{attempt}.bundle",
+            peer.fmt_short()
+        ))
     }
 
     /// Stores a peer's head from its bundle. True if it moved.
@@ -412,8 +420,9 @@ impl Vault {
         let before = self.git.value(["rev-parse", "-q", "--verify", &name]).ok();
         let mut cmd = self.git.command(["fetch", "-q", "--no-write-fetch-head"]);
         cmd.arg(bundle).arg(format!("+HEAD:{name}"));
-        exec(cmd)?;
+        let fetched = exec(cmd);
         fs::remove_file(bundle)?;
+        fetched?;
         Ok(self.git.value(["rev-parse", &name]).ok() != before)
     }
 

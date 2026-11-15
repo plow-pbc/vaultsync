@@ -154,7 +154,11 @@ impl Net {
             anyhow::Ok(status == BUNDLE_FOLLOWS)
         })
         .await
-        .context("fetch timed out")??;
+        .context("fetch timed out")
+        .and_then(|r| r)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&path);
+        })?;
         if !arrived {
             return Ok(false);
         }
