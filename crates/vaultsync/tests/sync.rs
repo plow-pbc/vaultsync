@@ -2,7 +2,7 @@ use std::fs;
 use std::time::Duration;
 
 mod common;
-use common::{Mesh, Node, git, ok, wait_until};
+use common::{AFTER_RESTART, Mesh, Node, git, ok, wait_until};
 
 #[test]
 fn edits_reach_every_member_and_heads_settle() {
@@ -180,10 +180,6 @@ fn concurrent_offline_edits_merge_or_keep_both() {
     );
     mesh.converged(20);
 }
-
-/// After a restart, peers reach the daemon again once iroh drops the dead
-/// instance's path (up to 15 s idle) and a dial that went there times out.
-const AFTER_RESTART: u64 = 45;
 
 /// Waits for a daemon started with a crash hook to die.
 fn crashed(node: &mut Node) {

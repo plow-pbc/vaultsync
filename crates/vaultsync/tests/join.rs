@@ -2,7 +2,7 @@ use std::fs;
 use std::time::Duration;
 
 mod common;
-use common::{Mesh, Node, git, ok, vaultsync, wait_until};
+use common::{AFTER_RESTART, Mesh, Node, git, ok, vaultsync, wait_until};
 
 fn history(node: &Node) -> String {
     let gd = format!("--git-dir={}.git", node.folder.display());
@@ -118,7 +118,9 @@ fn a_removed_machine_is_refused_by_every_member_the_removal_reaches() {
     // m1 comes back, syncs with m0, and from then on refuses m2 too.
     mesh.start(1);
     assert!(
-        wait_until(30, || mesh.nodes[1].log_text().contains(&refused)),
+        wait_until(AFTER_RESTART, || mesh.nodes[1]
+            .log_text()
+            .contains(&refused)),
         "{}",
         mesh.logs()
     );
@@ -199,7 +201,9 @@ fn a_removal_wins_over_a_concurrent_member_change() {
     mesh.start(1);
     let refused = format!("refused connection from {}", &m2[..10]);
     assert!(
-        wait_until(30, || mesh.nodes[1].log_text().contains(&refused)),
+        wait_until(AFTER_RESTART, || mesh.nodes[1]
+            .log_text()
+            .contains(&refused)),
         "{}",
         mesh.logs()
     );

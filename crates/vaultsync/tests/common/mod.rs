@@ -51,6 +51,10 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+/// After a restart, peers reach the daemon again once iroh drops the dead
+/// instance's path (up to 15 s idle) and a dial that went there times out.
+pub const AFTER_RESTART: u64 = 45;
+
 /// Polls `cond` until it holds or `secs` pass; true if it held.
 pub fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
