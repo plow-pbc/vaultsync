@@ -50,7 +50,7 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
     });
 
     // Catch edits made while nothing was watching.
-    let mut retry = None;
+    let mut retry = Retry::default();
     edited(&vault, &net, &mut retry, &events).await;
     eprintln!(
         "watching {} as node {}",
@@ -60,6 +60,10 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
     while let Some(event) = rx.recv().await {
         match event {
             Event::Edited => edited(&vault, &net, &mut retry, &events).await,
+            Event::RetryCommit => {
+                retry.scheduled = false;
+                edited(&vault, &net, &mut retry, &events).await;
+            }
             Event::Poke(peer) => sync_with(&vault, &net, peer).await,
             Event::CatchUp => {
                 for peer in blocking(&vault, Vault::peers).await.unwrap_or_default() {
@@ -79,33 +83,43 @@ async fn blocking<T: Send + 'static>(
     spawn_blocking(move || f(&vault)).await?
 }
 
-/// Commits pending edits. On failure, schedules another try with backoff
-/// (1 s doubling to a minute) so the edit lands even if no other follows.
+/// Backoff for a commit that failed: at most one retry is ever scheduled.
+#[derive(Default)]
+struct Retry {
+    wait: Option<Duration>,
+    scheduled: bool,
+}
+
+/// Commits pending edits. On failure, schedules another try (1 s doubling
+/// to a minute) so the edit lands even if no other edit follows.
 async fn edited(
     vault: &Vault,
     net: &Net,
-    retry: &mut Option<Duration>,
+    retry: &mut Retry,
     events: &mpsc::UnboundedSender<Event>,
 ) {
     match blocking(vault, Vault::commit_pending).await {
         Ok(id) => {
-            *retry = None;
+            retry.wait = None;
             if let Some(id) = id {
                 eprintln!("committed {id}");
                 poke_all(vault, net).await;
             }
         }
         Err(e) => {
-            let wait = retry.map_or(Duration::from_secs(1), |w| {
+            let wait = retry.wait.map_or(Duration::from_secs(1), |w| {
                 (w * 2).min(Duration::from_secs(60))
             });
-            *retry = Some(wait);
+            retry.wait = Some(wait);
             eprintln!("commit failed, retrying in {}s: {e:#}", wait.as_secs());
-            let events = events.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(wait).await;
-                let _ = events.send(Event::Edited);
-            });
+            if !retry.scheduled {
+                retry.scheduled = true;
+                let events = events.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(wait).await;
+                    let _ = events.send(Event::RetryCommit);
+                });
+            }
         }
     }
 }
