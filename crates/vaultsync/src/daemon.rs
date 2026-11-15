@@ -197,7 +197,7 @@ impl Fetches {
         }
         let (vault, net, events) = (vault.clone(), net.clone(), events.clone());
         tokio::spawn(async move {
-            let result = net.fetch(&vault, peer).await.map(|_| ());
+            let result = net.fetch(&vault, peer).await;
             let _ = events.send(Event::Fetched(peer, result));
         });
     }

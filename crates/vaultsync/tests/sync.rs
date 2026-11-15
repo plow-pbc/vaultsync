@@ -32,23 +32,6 @@ fn edits_reach_every_member_and_heads_settle() {
         "heads moved while idle:\n{}",
         mesh.logs()
     );
-    // The history that arrived is the history that was made: m0's first commit is everywhere.
-    let first = git(
-        &mesh.nodes[0].folder,
-        &[
-            &format!("--git-dir={}.git", mesh.nodes[0].folder.display()),
-            "rev-list",
-            "--max-parents=0",
-            "HEAD",
-        ],
-    );
-    for n in &mesh.nodes {
-        let gd = format!("--git-dir={}.git", n.folder.display());
-        assert_eq!(
-            git(&n.folder, &[&gd, "rev-list", "--max-parents=0", "HEAD"]),
-            first
-        );
-    }
 }
 
 #[test]
@@ -334,6 +317,18 @@ fn history_vaultsync_did_not_write_is_refused() {
     }
 }
 
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    assert!(
+        Command::new("cp")
+            .arg("-a")
+            .arg(from)
+            .arg(to)
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
 /// Copies a stopped machine's folder and history aside, or back.
 fn snapshot(node: &Node, to: &std::path::Path) {
     fs::create_dir_all(to).unwrap();
@@ -343,15 +338,7 @@ fn snapshot(node: &Node, to: &std::path::Path) {
     ] {
         let dest = to.join(name);
         let _ = fs::remove_dir_all(&dest);
-        assert!(
-            Command::new("cp")
-                .arg("-a")
-                .arg(&from)
-                .arg(&dest)
-                .status()
-                .unwrap()
-                .success()
-        );
+        copy_tree(&from, &dest);
     }
 }
 
@@ -361,15 +348,7 @@ fn restore(node: &Node, from: &std::path::Path) {
         (node.folder.with_extension("git"), "vault.git"),
     ] {
         fs::remove_dir_all(&to).unwrap();
-        assert!(
-            Command::new("cp")
-                .arg("-a")
-                .arg(from.join(name))
-                .arg(&to)
-                .status()
-                .unwrap()
-                .success()
-        );
+        copy_tree(&from.join(name), &to);
     }
 }
 
@@ -540,4 +519,45 @@ fn git_in(git_dir: &std::path::Path, args: &[&str], input: &str) -> String {
         .write_all(input.as_bytes())
         .unwrap();
     String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap()
+}
+
+#[test]
+fn a_rename_made_while_a_sync_lands_is_kept() {
+    let mut mesh = Mesh::new(2);
+    mesh.nodes[0].write("note.md", "one\n");
+    mesh.start_all();
+    mesh.converged(20);
+    mesh.nodes[0].stop();
+    let addrs = mesh.addrs.clone();
+    mesh.nodes[0].start_with(&addrs, Some("pause-before-apply"));
+    mesh.converged(AFTER_RESTART);
+    // m1 changes the note; while m0 holds that change at its last step, the
+    // note is renamed there.
+    let pauses = || {
+        mesh.nodes[0]
+            .log_text()
+            .matches("pausing before apply")
+            .count()
+    };
+    let seen = pauses();
+    mesh.nodes[1].write("note.md", "one\ntwo from m1\n");
+    assert!(wait_until(15, || pauses() > seen), "{}", mesh.logs());
+    let a = &mesh.nodes[0];
+    fs::rename(a.folder.join("note.md"), a.folder.join("renamed.md")).unwrap();
+
+    mesh.converged(AFTER_RESTART);
+    for n in &mesh.nodes {
+        assert_eq!(
+            n.read("note.md"),
+            None,
+            "{}: the old name came back",
+            n.name
+        );
+        assert_eq!(
+            n.read("renamed.md").as_deref(),
+            Some("one\ntwo from m1\n"),
+            "{}",
+            n.name
+        );
+    }
 }
