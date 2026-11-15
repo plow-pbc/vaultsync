@@ -36,6 +36,8 @@ pub enum Event {
     /// A peer has new commits.
     Poke(EndpointId),
     CatchUp,
+    /// A fetch from this peer finished; the number tells attempts apart.
+    Fetched(EndpointId, u64, Result<()>),
 }
 
 /// How peers find each other: n0's relays and address lookup, or (for tests
@@ -175,6 +177,9 @@ async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>
         eprintln!("refused connection from {}: not a member", peer.fmt_short());
         conn.close(1u32.into(), b"not a member");
         return Ok(());
+    }
+    if crate::vault::hooked("stall-serving") {
+        std::future::pending::<()>().await;
     }
     let (mut send, mut recv) = conn.accept_bi().await?;
     let request = timeout(REQUEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
