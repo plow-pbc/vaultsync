@@ -274,44 +274,58 @@ fn rollback_never_changes_the_member_list() {
 
 #[test]
 fn a_fetch_that_began_before_a_removal_gets_nothing_after_it() {
-    let mut mesh = Mesh::new(2);
-    let addrs = mesh.addrs.clone();
-    mesh.nodes[0].start_with(&addrs, Some("pause-before-bundle"));
-    mesh.start(1);
-    mesh.converged(AFTER_RESTART);
-    // The moment one of m1's fetches is held mid-request, remove m1 and write.
-    let pauses = || {
-        mesh.nodes[0]
-            .log_text()
-            .matches("pausing before the bundle")
-            .count()
-    };
-    let seen = pauses();
-    assert!(wait_until(15, || pauses() > seen), "{}", mesh.logs());
-    ok(&mesh.nodes[0].folder, &["remove", "m1"]);
-    mesh.nodes[0].write("secret.md", "after m1 was removed\n");
+    // m1's request is held just before, or just after, m0 decides what to
+    // send it; either way m1 is removed and a note written meanwhile.
+    for (point, settled) in [
+        ("pause-before-snapshot", "is no longer a member"),
+        ("pause-after-snapshot", "refused connection from"),
+    ] {
+        let mut mesh = Mesh::new(2);
+        let addrs = mesh.addrs.clone();
+        mesh.nodes[0].start_with(&addrs, Some(point));
+        mesh.start(1);
+        mesh.converged(AFTER_RESTART);
+        // Something new for m1, so the held request has a bundle to send.
+        mesh.nodes[0].write("before.md", "written before the removal\n");
+        mesh.nodes[0].committed();
+        let pauses = || mesh.nodes[0].log_text().matches(point).count();
+        let seen = pauses();
+        assert!(
+            wait_until(15, || pauses() > seen),
+            "{point}: {}",
+            mesh.logs()
+        );
+        ok(&mesh.nodes[0].folder, &["remove", "m1"]);
+        mesh.nodes[0].write("secret.md", "after m1 was removed\n");
 
-    // The held request resumes, is turned away, and nothing reached m1.
-    let turned_away = || mesh.nodes[0].log_text().contains("is no longer a member");
-    assert!(wait_until(15, turned_away), "{}", mesh.logs());
-    assert_eq!(mesh.nodes[1].read("secret.md"), None, "{}", mesh.logs());
-    // Not even its contents reached m1's history.
-    let gd0 = format!("--git-dir={}.git", mesh.nodes[0].folder.display());
-    let blob = git(
-        &mesh.nodes[0].folder,
-        &[&gd0, "rev-parse", "HEAD:secret.md"],
-    );
-    let in_m1 = std::process::Command::new("git")
-        .arg(format!("--git-dir={}.git", mesh.nodes[1].folder.display()))
-        .args(["cat-file", "-e", blob.trim()])
-        .status()
-        .unwrap();
-    assert!(!in_m1.success(), "m1 received the secret's contents");
-    assert!(
-        mesh.nodes[0].log_text().contains("is no longer a member"),
-        "{}",
-        mesh.logs()
-    );
+        // Turned away, or sent only what came before the removal; after
+        // that m1 is refused outright.
+        let done = || mesh.nodes[0].log_text().contains(settled);
+        assert!(wait_until(20, done), "{point}: {}", mesh.logs());
+        let gd0 = format!("--git-dir={}.git", mesh.nodes[0].folder.display());
+        let blob = git(
+            &mesh.nodes[0].folder,
+            &[&gd0, "rev-parse", "HEAD:secret.md"],
+        );
+        let in_m1 = std::process::Command::new("git")
+            .arg(format!("--git-dir={}.git", mesh.nodes[1].folder.display()))
+            .args(["cat-file", "-e", blob.trim()])
+            .status()
+            .unwrap();
+        assert!(
+            !in_m1.success(),
+            "{point}: m1 received the secret's contents"
+        );
+        assert_eq!(mesh.nodes[1].read("secret.md"), None, "{point}");
+        if point == "pause-after-snapshot" {
+            let got = || mesh.nodes[1].read("before.md").is_some();
+            assert!(
+                wait_until(10, got),
+                "what came before the removal still arrives: {}",
+                mesh.logs()
+            );
+        }
+    }
 }
 
 #[test]

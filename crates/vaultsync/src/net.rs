@@ -242,23 +242,23 @@ async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>
                 .lines()
                 .map(str::to_owned)
                 .collect();
-            if crate::vault::hooked("pause-before-bundle") {
-                eprintln!("test hook: pausing before the bundle");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
+            pause_if_hooked("pause-before-snapshot").await;
             let v = vault.clone();
-            let (present, news) = spawn_blocking(move || {
-                // Removed since the request began? Then it gets nothing.
-                if !v.members()?.contains(&peer) {
+            // One snapshot: membership is judged, and the bundle cut, at the
+            // same commit, so a removal can't land between the two.
+            let (head, present, news) = spawn_blocking(move || {
+                let head = v.head()?;
+                if !v.members_at(&head)?.contains(&peer) {
                     bail!("{} is no longer a member", peer.fmt_short());
                 }
                 let present = v.present(&haves)?;
-                let news = v.has_news(&present)?;
-                anyhow::Ok((present, news))
+                let news = v.has_news(&head, &present)?;
+                anyhow::Ok((head, present, news))
             })
             .await??;
+            pause_if_hooked("pause-after-snapshot").await;
             if news {
-                send_bundle(&vault, &present, &mut send).await?;
+                send_bundle(&vault, &head, &present, &mut send).await?;
             } else {
                 send.write_all(&[NOTHING_NEW]).await?;
             }
@@ -290,7 +290,8 @@ async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>
                     eprintln!("{name} ({}) joined", peer.fmt_short());
                     // Tell the other members about the newcomer.
                     let _ = events.send(Event::Edited);
-                    send_bundle(&vault, &[], &mut send).await?;
+                    let head = vault.head()?;
+                    send_bundle(&vault, &head, &[], &mut send).await?;
                 }
                 Err(e) => {
                     eprintln!("refused join from {}: {e:#}", peer.fmt_short());
@@ -307,16 +308,35 @@ async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>
     Ok(())
 }
 
-/// Streams a bundle of HEAD, less what the peer `haves`.
-async fn send_bundle(vault: &Vault, haves: &[String], send: &mut noq::SendStream) -> Result<()> {
-    send.write_all(&[BUNDLE_FOLLOWS]).await?;
-    let mut child = tokio::process::Command::from(vault.bundle_command(haves))
-        .stdout(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
-    tokio::io::copy(child.stdout.as_mut().expect("piped"), send).await?;
-    if !child.wait().await?.success() {
-        bail!("git bundle failed");
+/// Streams a bundle of `head`, less what the peer `haves`.
+async fn send_bundle(
+    vault: &Vault,
+    head: &str,
+    haves: &[String],
+    send: &mut noq::SendStream,
+) -> Result<()> {
+    let pinned = vault.pin(head)?;
+    let sent = async {
+        send.write_all(&[BUNDLE_FOLLOWS]).await?;
+        let mut child = tokio::process::Command::from(vault.bundle_command(&pinned, haves))
+            .stdout(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        tokio::io::copy(child.stdout.as_mut().expect("piped"), send).await?;
+        if !child.wait().await?.success() {
+            bail!("git bundle failed");
+        }
+        anyhow::Ok(())
     }
-    Ok(())
+    .await;
+    vault.unpin(&pinned)?;
+    sent
+}
+
+/// Test hook: hold a request at a named point for 5 s.
+async fn pause_if_hooked(point: &str) {
+    if crate::vault::hooked(point) {
+        eprintln!("test hook: {point}");
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
 }
