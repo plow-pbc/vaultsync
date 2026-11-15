@@ -282,16 +282,16 @@ async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>
             let (v, n) = (vault.clone(), name.clone());
             let admitted = spawn_blocking(move || {
                 v.consume_invite(&secret)?;
-                v.add_member(peer, &n)
+                v.resolve(&v.add_member(peer, &n)?)
             })
             .await?;
             match admitted {
-                Ok(_) => {
+                // The newcomer gets the vault as of its admission, nothing later.
+                Ok(admission) => {
                     eprintln!("{name} ({}) joined", peer.fmt_short());
                     // Tell the other members about the newcomer.
                     let _ = events.send(Event::Edited);
-                    let head = vault.head()?;
-                    send_bundle(&vault, &head, &[], &mut send).await?;
+                    send_bundle(&vault, &admission, &[], &mut send).await?;
                 }
                 Err(e) => {
                     eprintln!("refused join from {}: {e:#}", peer.fmt_short());

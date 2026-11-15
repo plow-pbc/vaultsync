@@ -141,6 +141,12 @@ impl Vault {
         self.git.value(["config", MACHINE_KEY])
     }
 
+    /// The full id of a commit.
+    pub fn resolve(&self, rev: &str) -> Result<String> {
+        self.git
+            .value(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])
+    }
+
     pub fn head(&self) -> Result<String> {
         self.git.value(["rev-parse", "--verify", "-q", "HEAD"])
     }
@@ -673,6 +679,14 @@ impl Vault {
         };
         for _ in 0..APPLY_TRIES {
             self.commit_pending_locked()?;
+            // History straight from a peer removed meanwhile counts for nothing;
+            // what a current member relays is judged commit by commit.
+            if !self.members()?.contains(peer) {
+                bail!(
+                    "refusing history from {}: no longer a member",
+                    peer.fmt_short()
+                );
+            }
             let head = self.head()?;
             if self.is_ancestor(&tip, &head) {
                 return Ok(None);

@@ -8,7 +8,7 @@
 //! deterministic merge of its parents. A removed machine stays removed: its tombstone
 //! (`removed <id> <name>`) outranks any line listing it, and never goes away.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context, Result, bail};
 use iroh::{EndpointId, SecretKey, Signature};
@@ -136,17 +136,43 @@ pub fn validate(git: &Git, head: &str, tip: &str, trusted: &Members) -> Result<(
         }
         Ok(lists[rev].clone())
     };
-    for line in graph.lines() {
-        let line: Vec<&str> = line.split(' ').collect();
+    let commits: Vec<Vec<&str>> = graph.lines().map(|l| l.split(' ').collect()).collect();
+    // A trusted member's signed commit that starts the member list vouches
+    // for the history beneath it: an imported vault's unsigned past.
+    let mut introductions = Vec::new();
+    for line in &commits {
+        let (commit, parents) = (line[0], &line[1..]);
+        let starts_list = parents.len() <= 1
+            && at_cached(commit)?.is_some()
+            && parents
+                .first()
+                .map(|p| at_cached(p))
+                .transpose()?
+                .flatten()
+                .is_none();
+        if starts_list && signer(git, commit)?.is_some_and(|id| trusted.contains(&id)) {
+            introductions.push(commit);
+        }
+    }
+    let vouched: HashSet<String> = if introductions.is_empty() {
+        HashSet::new()
+    } else {
+        let mut args = vec!["rev-list"];
+        args.extend(&introductions);
+        args.extend(["--not", head]);
+        git.run(args)?.lines().map(str::to_owned).collect()
+    };
+    for line in &commits {
         let (commit, parents) = (line[0], &line[1..]);
         let ours = at_cached(commit)?;
         if parents.len() > 1 {
-            let mut member_era = false;
+            let mut member_era = ours.is_some();
             for p in parents {
                 member_era |= at_cached(p)?.is_some();
             }
             // Merges are deterministic: whoever merges these parents makes this
-            // exact commit, so one that differs was forged.
+            // exact commit, so one that differs (or invents a member list) was
+            // forged.
             if member_era && (parents.len() != 2 || merge(git, parents[0], parents[1])? != commit) {
                 bail!("merge {commit} is not the merge of its parents");
             }
@@ -155,10 +181,11 @@ pub fn validate(git: &Git, head: &str, tip: &str, trusted: &Members) -> Result<(
         let signed_by = signer(git, commit)?;
         match parents.first().map(|p| at_cached(p)).transpose()?.flatten() {
             // No member list at its parent: a root, or history from before the
-            // vault had one. Only a current member may bring that in; a removed
+            // vault had one. Only a current member may bring that in, by signing
+            // it or the commit that starts the list on top of it; a removed
             // machine could otherwise start a fresh, unsigned line of history.
             None => {
-                if !signed_by.is_some_and(|id| trusted.contains(&id)) {
+                if !signed_by.is_some_and(|id| trusted.contains(&id)) && !vouched.contains(commit) {
                     bail!(
                         "commit {commit} has no member list behind it and no current member's signature"
                     );
