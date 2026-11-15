@@ -29,6 +29,8 @@ const BUNDLE_FOLLOWS: u8 = 0;
 const NOTHING_NEW: u8 = 1;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest a fetch's transfer may take.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// What the daemon reacts to.
 pub enum Event {
@@ -136,21 +138,28 @@ impl Net {
     pub async fn fetch(&self, vault: &Vault, peer: EndpointId) -> Result<bool> {
         let v = vault.clone();
         let haves = spawn_blocking(move || v.haves()).await??;
-        let (conn, mut recv, status) = self
-            .request(peer, FETCH, haves.join("\n").as_bytes())
-            .await?;
-        let moved = if status == BUNDLE_FOLLOWS {
-            let path = vault.incoming(&peer)?;
-            let mut file = tokio::fs::File::create(&path).await?;
-            tokio::io::copy(&mut recv, &mut file).await?;
-            file.flush().await?;
-            let v = vault.clone();
-            spawn_blocking(move || v.receive(&peer, &path)).await??
-        } else {
-            false
-        };
-        conn.close(0u32.into(), b"done");
-        Ok(moved)
+        let path = vault.incoming(&peer)?;
+        // Only the transfer can time out: the import below always finishes,
+        // since cancelling it would leave it running against the next fetch.
+        let arrived = timeout(FETCH_TIMEOUT, async {
+            let (conn, mut recv, status) = self
+                .request(peer, FETCH, haves.join("\n").as_bytes())
+                .await?;
+            if status == BUNDLE_FOLLOWS {
+                let mut file = tokio::fs::File::create(&path).await?;
+                tokio::io::copy(&mut recv, &mut file).await?;
+                file.flush().await?;
+            }
+            conn.close(0u32.into(), b"done");
+            anyhow::Ok(status == BUNDLE_FOLLOWS)
+        })
+        .await
+        .context("fetch timed out")??;
+        if !arrived {
+            return Ok(false);
+        }
+        let v = vault.clone();
+        spawn_blocking(move || v.receive(&peer, &path)).await?
     }
 
     /// Answers peers until the endpoint closes.

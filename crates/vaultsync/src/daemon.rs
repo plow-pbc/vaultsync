@@ -16,8 +16,6 @@ use crate::net::{Event, Net};
 use crate::vault::Vault;
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
-/// Longest a fetch may take before the daemon moves on.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct Opts {
     pub catch_up: Duration,
@@ -154,10 +152,7 @@ impl Fetches {
         }
         let (vault, net, events) = (vault.clone(), net.clone(), events.clone());
         tokio::spawn(async move {
-            let result = match tokio::time::timeout(FETCH_TIMEOUT, net.fetch(&vault, peer)).await {
-                Ok(result) => result.map(|_| ()),
-                Err(_) => Err(anyhow::anyhow!("timed out")),
-            };
+            let result = net.fetch(&vault, peer).await.map(|_| ());
             let _ = events.send(Event::Fetched(peer, result));
         });
     }
