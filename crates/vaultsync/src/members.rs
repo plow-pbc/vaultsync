@@ -4,16 +4,17 @@
 //! Every commit this tool makes carries `Vault-Signature: <node id> <sig>`, an
 //! ed25519 signature by the machine's node key over the commit's tree and
 //! parents. Once a vault has a member list, a commit arriving from a peer is
-//! accepted only if a member at its parent signed it; a merge may only combine
-//! its parents' lists. A removed machine stays removed: its tombstone
+//! accepted only if a member at its parent signed it, or it is exactly the
+//! deterministic merge of its parents. A removed machine stays removed: its tombstone
 //! (`removed <id> <name>`) outranks any line listing it, and never goes away.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result, bail};
 use iroh::{EndpointId, SecretKey, Signature};
 
 use crate::git::Git;
+use crate::merge::merge;
 
 pub const MEMBERS_PATH: &str = ".vault/members";
 const TRAILER: &str = "Vault-Signature:";
@@ -139,19 +140,15 @@ pub fn validate(git: &Git, head: &str, tip: &str, trusted: &Members) -> Result<(
         let line: Vec<&str> = line.split(' ').collect();
         let (commit, parents) = (line[0], &line[1..]);
         let ours = at_cached(commit)?;
-        // A merge carries exactly what both sides listed and removed, signed or not.
         if parents.len() > 1 {
-            let (mut listed, mut removed) = (BTreeSet::new(), BTreeSet::new());
+            let mut member_era = false;
             for p in parents {
-                let theirs = at_cached(p)?.unwrap_or_default();
-                listed.extend(theirs.listed.into_keys());
-                removed.extend(theirs.removed.into_keys());
+                member_era |= at_cached(p)?.is_some();
             }
-            let ours = ours.unwrap_or_default();
-            if ours.listed.into_keys().collect::<BTreeSet<_>>() != listed
-                || ours.removed.into_keys().collect::<BTreeSet<_>>() != removed
-            {
-                bail!("merge {commit} does not keep exactly its parents' members");
+            // Merges are deterministic: whoever merges these parents makes this
+            // exact commit, so one that differs was forged.
+            if member_era && (parents.len() != 2 || merge(git, parents[0], parents[1])? != commit) {
+                bail!("merge {commit} is not the merge of its parents");
             }
             continue;
         }
@@ -167,7 +164,9 @@ pub fn validate(git: &Git, head: &str, tip: &str, trusted: &Members) -> Result<(
                 if !signed_by.is_some_and(|id| before.contains(&id)) {
                     bail!("commit {commit} is not signed by a member");
                 }
-                let after = ours.unwrap_or_default();
+                let Some(after) = ours else {
+                    bail!("commit {commit} deletes the member list");
+                };
                 if !before
                     .removed
                     .keys()

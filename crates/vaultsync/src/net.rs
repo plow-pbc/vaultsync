@@ -203,16 +203,22 @@ async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>
         std::future::pending::<()>().await;
     }
     let (mut send, mut recv) = conn.accept_bi().await?;
-    let request = timeout(REQUEST_TIMEOUT, recv.read_to_end(1 << 20)).await??;
-    let Some((&kind, body)) = request.strip_prefix(MAGIC).and_then(|r| r.split_first()) else {
+    // Only the header before checking who is asking; a joiner's body is small.
+    let mut header = [0u8; 4];
+    timeout(REQUEST_TIMEOUT, recv.read_exact(&mut header)).await??;
+    let kind = header[3];
+    if &header[..3] != MAGIC {
         bail!("{} sent a malformed request", peer.fmt_short());
-    };
+    }
     let v = vault.clone();
     if kind != JOIN && !spawn_blocking(move || v.members()).await??.contains(&peer) {
         eprintln!("refused connection from {}: not a member", peer.fmt_short());
         conn.close(1u32.into(), b"not a member");
         return Ok(());
     }
+    let limit = if kind == JOIN { 1024 } else { 1 << 20 };
+    let body = timeout(REQUEST_TIMEOUT, recv.read_to_end(limit)).await??;
+    let body = body.as_slice();
     match kind {
         POKE => {
             let _ = events.send(Event::Poke(peer));

@@ -102,7 +102,7 @@ fn concurrent_offline_edits_merge_or_keep_both() {
     // concurrent additions touch the same lines.
     let gap = |n: &Node| mesh.nodes.iter().filter(|m| m.id < n.id).count();
     let extra_a = Node::new(mesh._tmp.path(), "extra-a");
-    let extra_b = (0..40)
+    let extra_b = (0..)
         .map(|i| Node::new(mesh._tmp.path(), &format!("extra-b{i}")))
         .find(|b| gap(b) == gap(&extra_a))
         .unwrap();
@@ -284,32 +284,55 @@ fn a_stalled_peer_does_not_hold_up_local_commits() {
 }
 
 #[test]
-fn unsigned_member_change_is_refused() {
-    let mut mesh = Mesh::new(2);
-    let rogue = Node::new(mesh._tmp.path(), "rogue");
-    // m1's history gains a member change made without vaultsync's signature.
-    let b = &mesh.nodes[1];
-    let mut members = b.read(".vault/members").unwrap();
-    members.push_str(&format!("{} rogue\n", rogue.id));
-    b.write(".vault/members", &members);
-    b.write("smuggled.md", "x\n");
-    let gd = format!("--git-dir={}.git", b.folder.display());
-    let wt = format!("--work-tree={}", b.folder.display());
-    git(&b.folder, &[&gd, &wt, "add", "-A"]);
-    git(&b.folder, &[&gd, &wt, "commit", "-qm", "sneak a member in"]);
+fn history_vaultsync_did_not_write_is_refused() {
+    for forgery in ["unsigned commit", "doctored merge"] {
+        let mut mesh = Mesh::new(2);
+        let rogue = Node::new(mesh._tmp.path(), "rogue");
+        // m1's history gains a member and a file vaultsync never signed.
+        let b = &mesh.nodes[1];
+        let mut members = b.read(".vault/members").unwrap();
+        members.push_str(&format!("{} rogue\n", rogue.id));
+        b.write(".vault/members", &members);
+        b.write("smuggled.md", "x\n");
+        let gd = format!("--git-dir={}.git", b.folder.display());
+        let wt = format!("--work-tree={}", b.folder.display());
+        git(&b.folder, &[&gd, &wt, "add", "-A"]);
+        if forgery == "unsigned commit" {
+            git(&b.folder, &[&gd, &wt, "commit", "-qm", "sneak a member in"]);
+        } else {
+            // Dressed as a merge of two real commits, but with its own tree.
+            let tree = git(&b.folder, &[&gd, &wt, "write-tree"]);
+            let merge = git(
+                &b.folder,
+                &[
+                    &gd,
+                    "commit-tree",
+                    tree.trim(),
+                    "-p",
+                    "HEAD",
+                    "-p",
+                    "HEAD~1",
+                    "-m",
+                    "Merge",
+                ],
+            );
+            git(&b.folder, &[&gd, "update-ref", "HEAD", merge.trim()]);
+        }
 
-    mesh.start_all();
-    let refused = format!("refusing history from {}", &mesh.nodes[1].id[..10]);
-    assert!(
-        wait_until(15, || mesh.nodes[0].log_text().contains(&refused)),
-        "{}",
-        mesh.logs()
-    );
-    assert_eq!(mesh.nodes[0].read("smuggled.md"), None);
-    assert!(
-        !mesh.nodes[0]
-            .read(".vault/members")
-            .unwrap()
-            .contains(&rogue.id)
-    );
+        mesh.start_all();
+        let refused = format!("refusing history from {}", &mesh.nodes[1].id[..10]);
+        assert!(
+            wait_until(15, || mesh.nodes[0].log_text().contains(&refused)),
+            "{forgery}: {}",
+            mesh.logs()
+        );
+        assert_eq!(mesh.nodes[0].read("smuggled.md"), None, "{forgery}");
+        assert!(
+            !mesh.nodes[0]
+                .read(".vault/members")
+                .unwrap()
+                .contains(&rogue.id),
+            "{forgery}"
+        );
+    }
 }

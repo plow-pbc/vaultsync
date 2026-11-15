@@ -209,12 +209,16 @@ async fn integrate(vault: &Vault, net: &Net, peer: EndpointId, announced: &mut O
 
 /// Pokes every other member if HEAD moved since the last poke.
 async fn announce(vault: &Vault, net: &Net, announced: &mut Option<String>) {
-    let head = blocking(vault, Vault::head).await.ok();
-    if head == *announced {
+    let (head, peers) = match blocking(vault, |v| Ok((v.head()?, v.peers()?))).await {
+        Ok(found) => found,
+        // Left unannounced, so the next event tries again.
+        Err(e) => return eprintln!("could not tell peers about new commits: {e:#}"),
+    };
+    if Some(&head) == announced.as_ref() {
         return;
     }
-    *announced = head;
-    for peer in blocking(vault, Vault::peers).await.unwrap_or_default() {
+    *announced = Some(head);
+    for peer in peers {
         let net = net.clone();
         tokio::spawn(async move { net.poke(peer).await });
     }

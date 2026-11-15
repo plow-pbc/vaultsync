@@ -46,10 +46,10 @@ fn an_invite_works_once_and_not_after_it_expires() {
     let mut mesh = Mesh::new(1);
     mesh.start(0);
     let root = mesh._tmp.path().to_owned();
-    let code = mesh.nodes[0].invite(600);
-    Node::join(&root, "first", &code, &mesh.addrs).unwrap();
+    let used = mesh.nodes[0].invite(600);
+    Node::join(&root, "first", &used, &mesh.addrs).unwrap();
 
-    let reused = Node::join(&root, "second", &code, &mesh.addrs)
+    let reused = Node::join(&root, "second", &used, &mesh.addrs)
         .err()
         .expect("reuse must fail");
     assert!(reused.contains("already used"), "{reused}");
@@ -58,9 +58,9 @@ fn an_invite_works_once_and_not_after_it_expires() {
         "a failed join leaves nothing behind"
     );
 
-    let code = mesh.nodes[0].invite(1);
+    let stale = mesh.nodes[0].invite(1);
     std::thread::sleep(Duration::from_secs(2));
-    let expired = Node::join(&root, "late", &code, &mesh.addrs)
+    let expired = Node::join(&root, "late", &stale, &mesh.addrs)
         .err()
         .expect("an expired code must fail");
     assert!(expired.contains("expired"), "{expired}");
@@ -68,7 +68,10 @@ fn an_invite_works_once_and_not_after_it_expires() {
 
     let log = mesh.nodes[0].log_text();
     assert_eq!(log.matches("refused join").count(), 2, "{log}");
-    assert!(!log.contains(&code), "the code must never reach a log");
+    assert!(
+        !log.contains(&used) && !log.contains(&stale),
+        "codes must never reach a log"
+    );
 }
 
 #[test]
@@ -187,7 +190,7 @@ fn a_removal_wins_over_a_concurrent_member_change() {
         };
         !ids.iter().any(|id| lo < id.as_str() && id.as_str() < hi)
     };
-    let extra = (0..60)
+    let extra = (0..)
         .map(|i| Node::new(mesh._tmp.path(), &format!("extra{i}")))
         .find(|n| beside(&n.id))
         .unwrap();
