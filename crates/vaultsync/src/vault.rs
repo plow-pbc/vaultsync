@@ -367,7 +367,8 @@ impl Vault {
             "--format=%(objectname)",
             "refs/vaultsync/peers",
         ])?;
-        Ok(refs.lines().map(str::to_owned).chain(self.head()).collect())
+        let head = self.head()?;
+        Ok(refs.lines().map(str::to_owned).chain([head]).collect())
     }
 
     /// The subset of `ids` that are commits here.
