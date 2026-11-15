@@ -50,11 +50,12 @@ impl Node {
             .append(true)
             .open(&self.log)
             .unwrap();
+        // The log spans restarts: wait for this start's line, not an old one.
+        let started = format!("as node {}", self.id);
+        let before = self.log_text().matches(&started).count();
         self.daemon = Some(cmd.stderr(log).stdout(Stdio::null()).spawn().unwrap());
         assert!(
-            wait_until(10, || self
-                .log_text()
-                .contains(&format!("as node {}", self.id))),
+            wait_until(10, || self.log_text().matches(&started).count() > before),
             "{} never started:\n{}",
             self.name,
             self.log_text()
@@ -472,5 +473,110 @@ fn unsigned_member_change_is_refused() {
             .read(".vault/members")
             .unwrap()
             .contains(&rogue.id)
+    );
+}
+
+/// Copies a stopped machine's folder and history aside, or back.
+fn snapshot(node: &Node, to: &std::path::Path) {
+    fs::create_dir_all(to).unwrap();
+    for (from, name) in [
+        (node.folder.clone(), "vault"),
+        (node.folder.with_extension("git"), "vault.git"),
+    ] {
+        let dest = to.join(name);
+        let _ = fs::remove_dir_all(&dest);
+        assert!(
+            Command::new("cp")
+                .arg("-a")
+                .arg(&from)
+                .arg(&dest)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+}
+
+fn restore(node: &Node, from: &std::path::Path) {
+    for (to, name) in [
+        (node.folder.clone(), "vault"),
+        (node.folder.with_extension("git"), "vault.git"),
+    ] {
+        fs::remove_dir_all(&to).unwrap();
+        assert!(
+            Command::new("cp")
+                .arg("-a")
+                .arg(from.join(name))
+                .arg(&to)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+}
+
+#[test]
+fn heads_holding_the_same_edits_settle_without_merging_again() {
+    let mut mesh = Mesh::new(3);
+    let saves = mesh._tmp.path().join("saves");
+    let save = |n: &Node, label: &str| snapshot(n, &saves.join(format!("{}-{label}", n.name)));
+    let load = |n: &Node, label: &str| restore(n, &saves.join(format!("{}-{label}", n.name)));
+    mesh.start_all();
+    mesh.converged(20);
+    mesh.stop_all();
+    // One edit each, made alone.
+    for i in 0..3 {
+        mesh.nodes[i].write(&format!("from-m{i}.md"), "x\n");
+        mesh.start(i);
+        mesh.nodes[i].committed();
+        mesh.nodes[i].stop();
+        save(&mesh.nodes[i], "0");
+    }
+    // Two rounds of pairs, each machine merging with its neighbour's state from
+    // the round before: after round 2 every head holds all three edits, by
+    // three different merge paths. A ring of fetches lands here and, merging
+    // again, never stops.
+    for round in 1..=2 {
+        for (keep, other) in [(0, 1), (1, 2), (2, 0)] {
+            for i in [keep, other] {
+                load(&mesh.nodes[i], &(round - 1).to_string());
+            }
+            mesh.start(keep);
+            mesh.start(other);
+            let (k, o) = (&mesh.nodes[keep], &mesh.nodes[other]);
+            assert!(
+                wait_until(AFTER_RESTART, || k.head() == o.head()),
+                "{}",
+                mesh.logs()
+            );
+            mesh.nodes[keep].stop();
+            mesh.nodes[other].stop();
+            save(&mesh.nodes[keep], &format!("{round}-done"));
+        }
+        for n in &mesh.nodes {
+            restore(n, &saves.join(format!("{}-{round}-done", n.name)));
+            save(n, &round.to_string());
+        }
+    }
+    let heads: Vec<String> = mesh.nodes.iter().map(Node::head).collect();
+    assert_eq!(
+        heads
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        3,
+        "{heads:?}"
+    );
+    assert!(
+        mesh.nodes
+            .iter()
+            .all(|n| (0..3).all(|i| n.read(&format!("from-m{i}.md")).is_some()))
+    );
+
+    mesh.start_all();
+    let settled = mesh.converged(AFTER_RESTART);
+    assert!(
+        heads.contains(&settled),
+        "made a new merge {settled} instead of settling on one of {heads:?}"
     );
 }
