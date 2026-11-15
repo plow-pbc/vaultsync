@@ -1,63 +1,19 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Stdio};
+
+mod common;
+use common::{git, ok, vaultsync};
 use std::time::{Duration, Instant};
 
 const MACHINE: &str = "test-machine";
-
-fn vaultsync(vault: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_vaultsync"))
-        .arg("--vault")
-        .arg(vault)
-        .args(args)
-        .env_remove("VAULTSYNC_AGENT")
-        .output()
-        .unwrap()
-}
-
-fn ok(vault: &Path, args: &[&str]) -> String {
-    let out = vaultsync(vault, args);
-    assert!(
-        out.status.success(),
-        "vaultsync {args:?} failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).unwrap()
-}
 
 fn init(folder: &Path) -> String {
     ok(
         folder.parent().unwrap(),
         &["init", folder.to_str().unwrap(), "--machine", MACHINE],
     )
-}
-
-/// Plain git, independent of the code under test.
-fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .args([
-            "-c",
-            "user.name=someone",
-            "-c",
-            "user.email=someone@example.com",
-        ])
-        .args([
-            "-c",
-            "commit.gpgsign=false",
-            "-c",
-            "init.defaultBranch=main",
-        ])
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).unwrap()
 }
 
 fn git_dir(folder: &Path) -> PathBuf {
@@ -180,7 +136,8 @@ fn edit_becomes_commit_within_seconds() {
     let mut daemon = Command::new(env!("CARGO_BIN_EXE_vaultsync"))
         .arg("--vault")
         .arg(&folder)
-        .arg("run")
+        .args(["run", "--addr-dir"])
+        .arg(tmp.path())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
