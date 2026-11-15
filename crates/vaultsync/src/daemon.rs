@@ -109,6 +109,11 @@ fn watch(
 ) -> Result<Box<dyn Any + Send>> {
     if !poll {
         let native = new_debouncer(DEBOUNCE, handler.clone()).and_then(|mut d| {
+            if crate::vault::hooked("no-native-watch") {
+                return Err(notify::Error::generic(
+                    "native watching disabled for a test",
+                ));
+            }
             d.watcher().watch(folder, RecursiveMode::Recursive)?;
             Ok(d)
         });

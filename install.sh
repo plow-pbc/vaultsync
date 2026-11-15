@@ -104,6 +104,14 @@ else
     exit 0
 fi
 
+# Paths go verbatim into a plist and a unit file, and the default folder
+# comes from the invite code: allow only characters both take as is.
+for path in "$folder" "$BIN"; do
+    case $path in
+        *[!A-Za-z0-9._/@+,:\ -]*) die "unsupported characters in path '$path'; choose a plain one with --folder" ;;
+    esac
+done
+
 if [ $os = macos ]; then
     if [ -n "$folder" ]; then
         log=$HOME/Library/Logs/$NAME.log

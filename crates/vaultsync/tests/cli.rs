@@ -16,8 +16,9 @@ fn init(folder: &Path) -> String {
     )
 }
 
-fn start_daemon(folder: &Path, extra: &[&str]) -> std::process::Child {
+fn start_daemon(folder: &Path, extra: &[&str], hook: &str) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_vaultsync"))
+        .env("VAULTSYNC_TEST_HOOK", hook)
         .arg("--vault")
         .arg(folder)
         .args(["run", "--addr-dir"])
@@ -154,7 +155,7 @@ fn failed_auto_commit_is_retried_without_another_edit() {
     let tmp = tempfile::tempdir().unwrap();
     let folder = tmp.path().join("notes");
     init(&folder);
-    let mut daemon = start_daemon(&folder, &[]);
+    let mut daemon = start_daemon(&folder, &[], "");
     let mut stderr = BufReader::new(daemon.stderr.take().unwrap());
 
     // Another git process holds the index, so the commit fails.
@@ -219,14 +220,20 @@ fn rollback_never_overwrites_a_file_it_does_not_track() {
 
 #[test]
 fn edit_becomes_commit_within_seconds() {
-    // With the OS's file notifications, and by polling.
-    for extra in [&[][..], &["--poll"]] {
+    // With the OS's file notifications, by polling, and by polling because
+    // notifications failed to start.
+    for (extra, hook) in [(&[][..], ""), (&["--poll"], ""), (&[], "no-native-watch")] {
         let tmp = tempfile::tempdir().unwrap();
         let folder = tmp.path().join("notes");
         init(&folder);
-        let mut daemon = start_daemon(&folder, extra);
+        let mut daemon = start_daemon(&folder, extra, hook);
         let mut stderr = BufReader::new(daemon.stderr.take().unwrap());
         let mut line = String::new();
+        if !hook.is_empty() {
+            stderr.read_line(&mut line).unwrap();
+            assert!(line.contains("checking for changes every 2 s"), "{line}");
+            line.clear();
+        }
         stderr.read_line(&mut line).unwrap();
         assert!(line.contains("watching"), "{extra:?}: {line}");
 
