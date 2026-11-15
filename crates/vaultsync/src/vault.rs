@@ -168,7 +168,12 @@ impl Vault {
 
     /// The machines this one trusts: the member list at HEAD, plus itself.
     pub fn members(&self) -> Result<Members> {
-        let mut members = members::at(&self.git, "HEAD")?.unwrap_or_default();
+        self.members_at("HEAD")
+    }
+
+    /// The machines trusted as of `rev`, plus this one.
+    pub fn members_at(&self, rev: &str) -> Result<Members> {
+        let mut members = members::at(&self.git, rev)?.unwrap_or_default();
         members
             .listed
             .entry(self.node_id()?)
@@ -325,7 +330,8 @@ impl Vault {
         let mut cmd =
             self.git
                 .command(["fetch", "-q", "--update-head-ok", "--no-write-fetch-head"]);
-        cmd.arg(bundle).arg("+HEAD:refs/heads/main");
+        cmd.arg(bundle)
+            .arg(format!("+{}:refs/heads/main", self.bundle_ref(bundle)?));
         exec(cmd)?;
         fs::remove_file(bundle)?;
         // Refuses to overwrite a file someone saved there during the join.
@@ -581,19 +587,53 @@ impl Vault {
     }
 
     /// Whether HEAD has commits that `haves` lack.
-    pub fn has_news(&self, haves: &[String]) -> Result<bool> {
-        let mut args = vec!["rev-list", "-n1", "HEAD", "--not"];
+    pub fn has_news(&self, head: &str, haves: &[String]) -> Result<bool> {
+        let mut args = vec!["rev-list", "-n1", head, "--not"];
         args.extend(haves.iter().map(String::as_str));
         Ok(!self.git.run(args)?.is_empty())
     }
 
     /// `git bundle create - HEAD --not <haves>`, for streaming to a peer.
-    pub fn bundle_command(&self, haves: &[String]) -> std::process::Command {
-        let mut cmd = self.git.command(["bundle", "create", "-q", "-", "HEAD"]);
+    pub fn bundle_command(&self, pinned: &str, haves: &[String]) -> std::process::Command {
+        let mut cmd = self.git.command(["bundle", "create", "-q", "-", pinned]);
         if !haves.is_empty() {
             cmd.arg("--not").args(haves);
         }
         cmd
+    }
+
+    /// Names `commit` with a ref of its own, so a bundle carries exactly that
+    /// commit however HEAD moves meanwhile. Drop it with [`unpin`](Self::unpin).
+    pub fn pin(&self, commit: &str) -> Result<String> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let name = format!("refs/vaultsync/serving/{}-{n}", std::process::id());
+        self.git.run(["update-ref", &name, commit])?;
+        Ok(name)
+    }
+
+    pub fn unpin(&self, name: &str) -> Result<()> {
+        self.git.run(["update-ref", "-d", name]).map(drop)
+    }
+
+    /// Drops pins a crashed or cancelled request left behind.
+    pub fn unpin_all(&self) -> Result<()> {
+        let pins = self.git.run([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/vaultsync/serving",
+        ])?;
+        pins.lines().try_for_each(|name| self.unpin(name))
+    }
+
+    /// The one ref a peer's bundle carries.
+    fn bundle_ref(&self, bundle: &Path) -> Result<String> {
+        let mut cmd = self.git.command(["bundle", "list-heads"]);
+        cmd.arg(bundle);
+        let heads = exec(cmd)?;
+        let line = heads.lines().next().context("empty bundle")?;
+        let (_, name) = line.split_once(' ').context("malformed bundle")?;
+        Ok(name.to_owned())
     }
 
     /// Path for a bundle arriving from `peer`.
@@ -611,9 +651,11 @@ impl Vault {
     /// Stores a peer's head from its bundle.
     pub fn receive(&self, peer: &EndpointId, bundle: &Path) -> Result<()> {
         let name = peer_ref(peer);
-        let mut cmd = self.git.command(["fetch", "-q", "--no-write-fetch-head"]);
-        cmd.arg(bundle).arg(format!("+HEAD:{name}"));
-        let fetched = exec(cmd);
+        let fetched = self.bundle_ref(bundle).and_then(|r| {
+            let mut cmd = self.git.command(["fetch", "-q", "--no-write-fetch-head"]);
+            cmd.arg(bundle).arg(format!("+{r}:{name}"));
+            exec(cmd)
+        });
         fs::remove_file(bundle)?;
         fetched.map(drop)
     }
