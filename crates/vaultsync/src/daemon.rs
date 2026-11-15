@@ -1,13 +1,17 @@
 //! `vaultsync run`: commit edits as they happen and keep in step with every
 //! member that can be reached.
 
+use std::any::Any;
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
 use iroh::EndpointId;
-use notify_debouncer_mini::{DebounceEventResult, new_debouncer, notify::RecursiveMode};
+use notify_debouncer_mini::notify::{self, PollWatcher, RecursiveMode};
+use notify_debouncer_mini::{
+    Config, DebounceEventHandler, DebounceEventResult, new_debouncer, new_debouncer_opt,
+};
 use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
 use tokio::time::Instant;
@@ -16,10 +20,13 @@ use crate::net::{Event, Net};
 use crate::vault::Vault;
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
+/// How often to look for changes when polling.
+const POLL: Duration = Duration::from_secs(2);
 
 pub struct Opts {
     pub catch_up: Duration,
     pub addr_dir: Option<PathBuf>,
+    pub poll: bool,
 }
 
 pub fn run(vault: Vault, opts: Opts) -> Result<()> {
@@ -31,15 +38,16 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
     let (events, mut rx) = mpsc::unbounded_channel();
 
     let edits = events.clone();
-    let mut debouncer = new_debouncer(DEBOUNCE, move |res: DebounceEventResult| match res {
-        Ok(_) => {
-            let _ = edits.send(Event::Edited);
-        }
-        Err(e) => eprintln!("watch error: {e}"),
-    })?;
-    debouncer
-        .watcher()
-        .watch(vault.folder(), RecursiveMode::Recursive)?;
+    let _watch = watch(
+        vault.folder(),
+        opts.poll,
+        move |res: DebounceEventResult| match res {
+            Ok(_) => {
+                let _ = edits.send(Event::Edited);
+            }
+            Err(e) => eprintln!("watch error: {e}"),
+        },
+    )?;
     tokio::spawn(net.clone().serve(vault.clone(), events.clone()));
     let ticks = events.clone();
     tokio::spawn(async move {
@@ -89,6 +97,35 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Watches `folder` (until the returned value is dropped) with the OS's notifications, or by polling when asked to
+/// or when those are unavailable: a user can't raise an exhausted inotify
+/// limit without root.
+fn watch(
+    folder: &Path,
+    poll: bool,
+    handler: impl DebounceEventHandler + Clone,
+) -> Result<Box<dyn Any + Send>> {
+    if !poll {
+        let native = new_debouncer(DEBOUNCE, handler.clone()).and_then(|mut d| {
+            d.watcher().watch(folder, RecursiveMode::Recursive)?;
+            Ok(d)
+        });
+        match native {
+            Ok(d) => return Ok(Box::new(d)),
+            Err(e) => eprintln!(
+                "file notifications unavailable ({e}); checking for changes every {} s instead",
+                POLL.as_secs()
+            ),
+        }
+    }
+    let config = Config::default()
+        .with_timeout(DEBOUNCE)
+        .with_notify_config(notify::Config::default().with_poll_interval(POLL));
+    let mut d = new_debouncer_opt::<_, PollWatcher>(config, handler)?;
+    d.watcher().watch(folder, RecursiveMode::Recursive)?;
+    Ok(Box::new(d))
 }
 
 async fn blocking<T: Send + 'static>(

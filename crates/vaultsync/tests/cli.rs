@@ -16,12 +16,13 @@ fn init(folder: &Path) -> String {
     )
 }
 
-fn start_daemon(folder: &Path) -> std::process::Child {
+fn start_daemon(folder: &Path, extra: &[&str]) -> std::process::Child {
     Command::new(env!("CARGO_BIN_EXE_vaultsync"))
         .arg("--vault")
         .arg(folder)
         .args(["run", "--addr-dir"])
         .arg(folder.parent().unwrap())
+        .args(extra)
         .stderr(Stdio::piped())
         .spawn()
         .unwrap()
@@ -153,7 +154,7 @@ fn failed_auto_commit_is_retried_without_another_edit() {
     let tmp = tempfile::tempdir().unwrap();
     let folder = tmp.path().join("notes");
     init(&folder);
-    let mut daemon = start_daemon(&folder);
+    let mut daemon = start_daemon(&folder, &[]);
     let mut stderr = BufReader::new(daemon.stderr.take().unwrap());
 
     // Another git process holds the index, so the commit fails.
@@ -218,32 +219,41 @@ fn rollback_never_overwrites_a_file_it_does_not_track() {
 
 #[test]
 fn edit_becomes_commit_within_seconds() {
-    let tmp = tempfile::tempdir().unwrap();
-    let folder = tmp.path().join("notes");
-    init(&folder);
-    let mut daemon = start_daemon(&folder);
-    let mut stderr = BufReader::new(daemon.stderr.take().unwrap());
-    let mut line = String::new();
-    stderr.read_line(&mut line).unwrap();
-    assert!(line.contains("watching"), "{line}");
+    // With the OS's file notifications, and by polling.
+    for extra in [&[][..], &["--poll"]] {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("notes");
+        init(&folder);
+        let mut daemon = start_daemon(&folder, extra);
+        let mut stderr = BufReader::new(daemon.stderr.take().unwrap());
+        let mut line = String::new();
+        stderr.read_line(&mut line).unwrap();
+        assert!(line.contains("watching"), "{extra:?}: {line}");
 
-    let start = Instant::now();
-    fs::create_dir(folder.join("people")).unwrap();
-    fs::write(folder.join("people/ada.md"), "# Ada\n").unwrap();
-    let log = loop {
-        let log = ok(&folder, &["log", "-n", "1"]);
-        if log.contains("people/ada.md") || start.elapsed() > Duration::from_secs(10) {
-            break log;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    daemon.kill().unwrap();
-    daemon.wait().unwrap();
+        let start = Instant::now();
+        fs::create_dir(folder.join("people")).unwrap();
+        fs::write(folder.join("people/ada.md"), "# Ada\n").unwrap();
+        let log = loop {
+            let log = ok(&folder, &["log", "-n", "1"]);
+            if log.contains("people/ada.md") || start.elapsed() > Duration::from_secs(10) {
+                break log;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
 
-    println!("edit committed after {:?}: {log}", start.elapsed());
-    assert!(log.contains("Update people/ada.md"), "no commit: {log}");
-    assert!(log.contains(MACHINE), "{log}");
-    assert!(start.elapsed() < Duration::from_secs(5));
+        println!(
+            "{extra:?}: edit committed after {:?}: {log}",
+            start.elapsed()
+        );
+        assert!(
+            log.contains("Update people/ada.md"),
+            "{extra:?}: no commit: {log}"
+        );
+        assert!(log.contains(MACHINE), "{log}");
+        assert!(start.elapsed() < Duration::from_secs(5), "{extra:?}");
+    }
 }
 
 #[test]
