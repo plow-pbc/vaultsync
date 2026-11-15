@@ -61,7 +61,7 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
         match event {
             Event::Edited => edited(&vault, &net, &mut retry, &events).await,
             Event::RetryCommit => {
-                retry.scheduled = false;
+                retry.timer = None;
                 edited(&vault, &net, &mut retry, &events).await;
             }
             Event::Poke(peer) => sync_with(&vault, &net, peer).await,
@@ -83,11 +83,11 @@ async fn blocking<T: Send + 'static>(
     spawn_blocking(move || f(&vault)).await?
 }
 
-/// Backoff for a commit that failed: at most one retry is ever scheduled.
+/// Backoff for a commit that failed: at most one retry timer at a time.
 #[derive(Default)]
 struct Retry {
     wait: Option<Duration>,
-    scheduled: bool,
+    timer: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Commits pending edits. On failure, schedules another try (1 s doubling
@@ -101,6 +101,9 @@ async fn edited(
     match blocking(vault, Vault::commit_pending).await {
         Ok(id) => {
             retry.wait = None;
+            if let Some(timer) = retry.timer.take() {
+                timer.abort();
+            }
             if let Some(id) = id {
                 eprintln!("committed {id}");
                 poke_all(vault, net).await;
@@ -112,13 +115,12 @@ async fn edited(
             });
             retry.wait = Some(wait);
             eprintln!("commit failed, retrying in {}s: {e:#}", wait.as_secs());
-            if !retry.scheduled {
-                retry.scheduled = true;
+            if retry.timer.is_none() {
                 let events = events.clone();
-                tokio::spawn(async move {
+                retry.timer = Some(tokio::spawn(async move {
                     tokio::time::sleep(wait).await;
                     let _ = events.send(Event::RetryCommit);
-                });
+                }));
             }
         }
     }
