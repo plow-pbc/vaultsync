@@ -185,7 +185,17 @@ impl Vault {
         let mut members = self.members()?;
         members.insert(id, name.to_owned());
         let path = self.folder().join(MEMBERS_PATH);
-        fs::create_dir_all(path.parent().expect("has a parent"))?;
+        let dir = path.parent().expect("has a parent");
+        // Never write through a symlink a synced commit put there.
+        for p in [dir, &path] {
+            if fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+                bail!(
+                    "{} is a symlink; refusing to write the member list through it",
+                    p.display()
+                );
+            }
+        }
+        fs::create_dir_all(dir)?;
         fs::write(&path, members::format(&members))?;
         self.git.run(["add", MEMBERS_PATH])?;
         self.commit(&format!("Add member {name}"))
@@ -479,6 +489,16 @@ impl Vault {
     /// git would change was edited meanwhile; nothing is touched then. The
     /// intent file records how far it got, for `recover`.
     fn apply(&self, old: &str, new: &str) -> Result<bool> {
+        if hooked("pause-before-apply") {
+            eprintln!("test hook: pausing before apply");
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
+        // git's check below treats a deleted tracked file as clean and would
+        // write it back, so a rename made since the checkpoint would leave
+        // both names. Any tracked change since then: commit it and merge again.
+        if self.git.run(["diff", "--quiet"]).is_err() {
+            return Ok(false);
+        }
         let intent = self.state("apply")?;
         fs::write(&intent, format!("started {old} {new}\n"))?;
         crash_if_hooked("crash-before-worktree");
