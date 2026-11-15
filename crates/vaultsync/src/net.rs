@@ -222,6 +222,7 @@ async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>
     let conn = incoming.await?;
     let peer = conn.remote_id();
     if crate::vault::hooked("stall-serving") {
+        eprintln!("test hook: stall-serving");
         std::future::pending::<()>().await;
     }
     let (mut send, mut recv) = conn.accept_bi().await?;

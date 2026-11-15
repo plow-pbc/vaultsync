@@ -52,8 +52,8 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
 }
 
 /// After a restart, peers reach the daemon again once their connections to
-/// the dead instance idle out: 10 s, at worst about 15 s under load.
-pub const AFTER_RESTART: u64 = 20;
+/// the dead instance idle out: about 15 s at worst (35 s with QUIC's default).
+pub const AFTER_RESTART: u64 = 25;
 
 /// Polls `cond` until it holds or `secs` pass; true if it held.
 pub fn wait_until(secs: u64, mut cond: impl FnMut() -> bool) -> bool {

@@ -670,9 +670,14 @@ fn a_restarted_machine_s_edits_reach_its_peers_promptly() {
     let addrs = mesh.addrs.clone();
     mesh.start(1);
     mesh.nodes[0].start_with(&addrs, Some("stall-serving"));
-    // m1's catch-up is now waiting on m0, which never answers: it is
-    // mid-request to this instance when it dies.
-    std::thread::sleep(Duration::from_secs(2));
+    // m1 is mid-request to this instance, which never answers, when it dies.
+    assert!(
+        wait_until(10, || mesh.nodes[0]
+            .log_text()
+            .contains("test hook: stall-serving")),
+        "{}",
+        mesh.logs()
+    );
     mesh.nodes[0].stop();
     mesh.start(0);
     mesh.nodes[0].write("a.md", "after the restart\n");
