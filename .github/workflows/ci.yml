@@ -21,8 +21,11 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build --locked
       - run: cargo test --locked
+      # tar keeps the executable bit, which artifacts drop.
+      - if: matrix.os == 'macos-latest'
+        run: tar -czf vaultsync-macos.tar.gz -C target/debug vaultsync
       - if: matrix.os == 'macos-latest'
         uses: actions/upload-artifact@v4
         with:
-          name: vaultsync-macos-arm64
-          path: target/debug/vaultsync
+          name: vaultsync-macos
+          path: vaultsync-macos.tar.gz

@@ -57,7 +57,7 @@ enum Cmd {
     /// Commit edits as they happen and sync with the other members.
     Run {
         /// Seconds between catch-ups with every member.
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
         catch_up: u64,
         /// Find peers through address files in this directory instead of the
         /// network (tests, offline use).

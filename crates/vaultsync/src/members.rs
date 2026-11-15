@@ -117,21 +117,23 @@ pub fn validate(git: &Git, head: &str, tip: &str, trusted: &Members) -> Result<(
 
     for line in &commits {
         let (commit, parents) = (line[0], &line[1..]);
-        if parents.iter().any(|p| blob[p] == blob[commit])
-            || (parents.is_empty() && blob[commit].is_none())
-        {
+        // A merge carries exactly the members of both sides, signed or not.
+        if parents.len() > 1 {
+            let mut union = BTreeSet::new();
+            for p in parents {
+                union.extend(at(git, p)?.unwrap_or_default().into_keys());
+            }
+            let ours: BTreeSet<_> = at(git, commit)?.unwrap_or_default().into_keys().collect();
+            if ours != union {
+                bail!("merge {commit} does not keep exactly its parents' members");
+            }
             continue;
         }
-        let ours = at(git, commit)?.unwrap_or_default();
-        if parents.len() > 1 {
-            let mut union = Members::new();
-            for p in parents {
-                union.extend(at(git, p)?.unwrap_or_default());
-            }
-            if ours.keys().all(|id| union.contains_key(id)) {
-                continue;
-            }
-            bail!("merge {commit} adds members neither parent had");
+        if parents
+            .first()
+            .map_or(blob[commit].is_none(), |p| blob[p] == blob[commit])
+        {
+            continue;
         }
         let allowed = match parents.first() {
             Some(p) => at(git, p)?.unwrap_or_else(|| trusted.clone()),

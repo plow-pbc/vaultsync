@@ -216,7 +216,7 @@ fn non_member_is_refused() {
         mesh.logs()
     );
     assert!(
-        outsider.log_text().contains("not a member"),
+        wait_until(10, || outsider.log_text().contains("not a member")),
         "{}",
         outsider.log_text()
     );
