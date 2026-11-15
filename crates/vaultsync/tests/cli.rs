@@ -88,36 +88,36 @@ fn existing_repo(dir: &Path) {
 
 #[test]
 fn init_fresh_folder_keeps_history_beside_it() {
-    let tmp = tempfile::tempdir().unwrap();
-    let folder = tmp.path().join("notes");
-    fs::create_dir_all(folder.join("sub")).unwrap();
-    fs::write(folder.join("a.md"), "hello\n").unwrap();
+    // A folder with no git, and one that was `git init`ed but never committed.
+    for unborn in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("notes");
+        fs::create_dir_all(folder.join("sub")).unwrap();
+        fs::write(folder.join("a.md"), "hello\n").unwrap();
+        if unborn {
+            git(&folder, &["init", "-q"]);
+        }
 
-    init(&folder);
+        init(&folder);
 
-    assert!(
-        !folder.join(".git").exists(),
-        "vault folder must stay clean"
-    );
-    assert!(git_dir(&folder).is_dir());
-    // Found from a subfolder, without --vault pointing at the root.
-    let log = ok(&folder.join("sub"), &["log"]);
-    assert!(
-        log.contains(MACHINE) && log.contains("Initialize vault"),
-        "{log}"
-    );
-    let tracked = git(
-        tmp.path(),
-        &[
-            &format!("--git-dir={}", git_dir(&folder).display()),
-            "ls-files",
-        ],
-    );
-    assert_eq!(tracked, "a.md\n");
+        assert!(
+            !folder.join(".git").exists(),
+            "vault folder must stay clean"
+        );
+        assert!(git_dir(&folder).is_dir());
+        // Found from a subfolder, without --vault pointing at the root.
+        let log = ok(&folder.join("sub"), &["log"]);
+        assert!(
+            log.contains(MACHINE) && log.contains("Initialize vault"),
+            "{log}"
+        );
+        let gd = format!("--git-dir={}", git_dir(&folder).display());
+        assert_eq!(git(tmp.path(), &[&gd, "ls-files"]), "a.md\n");
 
-    fs::write(folder.join("b.md"), "new\n").unwrap();
-    let status = ok(&folder, &["status"]);
-    assert!(status.contains("1 uncommitted change"), "{status}");
+        fs::write(folder.join("b.md"), "new\n").unwrap();
+        let status = ok(&folder, &["status"]);
+        assert!(status.contains("1 uncommitted change"), "{status}");
+    }
 }
 
 #[test]

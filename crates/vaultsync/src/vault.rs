@@ -45,28 +45,28 @@ impl Vault {
         let vault = Vault::at(folder.canonicalize()?);
         let inner = vault.folder().join(".git");
         let beside = &vault.git.git_dir;
-        let fresh = match (fs::symlink_metadata(&inner).ok(), beside.exists()) {
+        match (fs::symlink_metadata(&inner).ok(), beside.exists()) {
             (Some(meta), false) if meta.is_dir() => {
-                fs::rename(&inner, beside).context("moving .git beside the folder")?;
-                false
+                fs::rename(&inner, beside).context("moving .git beside the folder")?
             }
             (Some(_), _) => bail!(
                 "{} has its own .git and {} also exists; refusing to choose between them",
                 vault.folder().display(),
                 beside.display()
             ),
-            (None, true) => {
-                // A bare snapshot has no index; build it from HEAD without touching refs.
-                if !beside.join("index").exists() {
-                    vault.git.run(["read-tree", "HEAD"])?;
-                }
-                false
-            }
+            (None, true) => {}
             (None, false) => {
                 vault.git.run(["init", "-q", "-b", "main"])?;
-                true
             }
-        };
+        }
+        let fresh = vault
+            .git
+            .run(["rev-parse", "--verify", "-q", "HEAD"])
+            .is_err();
+        // A bare snapshot has no index; build it from HEAD without touching refs.
+        if !fresh && !beside.join("index").exists() {
+            vault.git.run(["read-tree", "HEAD"])?;
+        }
         vault
             .git
             .run(["symbolic-ref", "-q", "HEAD"])

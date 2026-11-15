@@ -23,8 +23,16 @@ impl Git {
             .arg(&self.work_tree)
             .args(["-c", "commit.gpgsign=false", "-c", "core.quotepath=false"])
             .args(args)
-            .current_dir(&self.work_tree)
-            .env_remove("GIT_INDEX_FILE");
+            .current_dir(&self.work_tree);
+        // Inherited from a parent git process, these would point git at other storage.
+        for var in [
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_COMMON_DIR",
+        ] {
+            cmd.env_remove(var);
+        }
         cmd
     }
 
@@ -56,5 +64,5 @@ pub fn exec(mut cmd: Command) -> Result<String> {
             String::from_utf8_lossy(&out.stderr).trim()
         );
     }
-    Ok(String::from_utf8(out.stdout)?)
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
