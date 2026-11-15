@@ -32,6 +32,8 @@ const NOTHING_NEW: u8 = 1;
 const REFUSED: u8 = 2;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest a fetch's transfer may take.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// What the daemon reacts to.
 pub enum Event {
@@ -39,8 +41,8 @@ pub enum Event {
     /// A peer has new commits.
     Poke(EndpointId),
     CatchUp,
-    /// A fetch from this peer finished; the number tells attempts apart.
-    Fetched(EndpointId, u64, Result<()>),
+    /// A fetch from this peer finished.
+    Fetched(EndpointId, Result<()>),
 }
 
 /// How peers find each other: n0's relays and address lookup, or (for tests
@@ -139,21 +141,32 @@ impl Net {
     pub async fn fetch(&self, vault: &Vault, peer: EndpointId) -> Result<bool> {
         let v = vault.clone();
         let haves = spawn_blocking(move || v.haves()).await??;
-        let (conn, mut recv, status) = self
-            .request(peer, FETCH, haves.join("\n").as_bytes())
-            .await?;
-        let moved = if status == BUNDLE_FOLLOWS {
-            let path = vault.incoming(&peer)?;
-            let mut file = tokio::fs::File::create(&path).await?;
-            tokio::io::copy(&mut recv, &mut file).await?;
-            file.flush().await?;
-            let v = vault.clone();
-            spawn_blocking(move || v.receive(&peer, &path)).await??
-        } else {
-            false
-        };
-        conn.close(0u32.into(), b"done");
-        Ok(moved)
+        let path = vault.incoming(&peer)?;
+        // Only the transfer can time out: the import below always finishes,
+        // since cancelling it would leave it running against the next fetch.
+        let arrived = timeout(FETCH_TIMEOUT, async {
+            let (conn, mut recv, status) = self
+                .request(peer, FETCH, haves.join("\n").as_bytes())
+                .await?;
+            if status == BUNDLE_FOLLOWS {
+                let mut file = tokio::fs::File::create(&path).await?;
+                tokio::io::copy(&mut recv, &mut file).await?;
+                file.flush().await?;
+            }
+            conn.close(0u32.into(), b"done");
+            anyhow::Ok(status == BUNDLE_FOLLOWS)
+        })
+        .await
+        .context("fetch timed out")
+        .and_then(|r| r)
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&path);
+        })?;
+        if !arrived {
+            return Ok(false);
+        }
+        let v = vault.clone();
+        spawn_blocking(move || v.receive(&peer, &path)).await?
     }
 
     /// Presents an invite secret to `inviter` and returns the bundle of the
