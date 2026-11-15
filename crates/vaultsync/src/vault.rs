@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -187,18 +188,23 @@ impl Vault {
             .value(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])?;
         let short = self.git.value(["rev-parse", "--short", &id])?;
         self.commit_pending_locked()?;
+        let (tree, what) = match path {
+            None => (
+                self.git.value(["rev-parse", &format!("{id}^{{tree}}")])?,
+                "vault".to_owned(),
+            ),
+            Some(path) => (self.tree_with(&id, path)?, path.display().to_string()),
+        };
         // Git overwrites ignored files freely; refuse instead.
-        let mut added = self.git.command([
+        let added = self.git.run([
             "diff",
             "--name-only",
             "-z",
+            "--no-renames",
             "--diff-filter=A",
             "HEAD",
-            &id,
-            "--",
-        ]);
-        added.args(path);
-        let added = exec(added)?;
+            &tree,
+        ])?;
         let ignored = self.git.run([
             "ls-files",
             "-z",
@@ -221,32 +227,42 @@ impl Vault {
                 clash.join(", ")
             );
         }
-        // Both restores also refuse to overwrite a file saved since the checkpoint.
-        let target = match path {
-            None => {
-                self.git
-                    .run(["read-tree", "-m", "-u", "HEAD", &id])
-                    .context("files changed during rollback; try again")?;
-                "vault".to_owned()
-            }
-            Some(path) => {
-                let mut changed = self.git.command(["diff", "--quiet", "--"]);
-                changed.arg(path);
-                exec(changed).context("file changed during rollback; try again")?;
-                let mut cmd = self.git.command(["restore", "--staged", "--worktree"]);
-                cmd.arg(format!("--source={id}")).arg("--").arg(path);
-                exec(cmd)?;
-                path.display().to_string()
-            }
-        };
+        // One checked update for both modes: it refuses to overwrite a file
+        // saved since the checkpoint.
+        self.git
+            .run(["read-tree", "-m", "-u", "HEAD", &tree])
+            .context("files changed during rollback; try again")?;
         if self
             .git
             .run(["diff", "--cached", "--name-only"])?
             .is_empty()
         {
-            bail!("{target} already matches {short}");
+            bail!("{what} already matches {short}");
         }
-        self.commit(&format!("Roll back {target} to {short}"), false)
+        self.commit(&format!("Roll back {what} to {short}"), false)
+    }
+
+    /// HEAD's tree with `path` as it was at `id` (absent if it was absent),
+    /// built in a scratch index so the real one is untouched.
+    fn tree_with(&self, id: &str, path: &Path) -> Result<String> {
+        let index = self.git.git_dir.join("vaultsync-rollback-index");
+        let with_index = |args: &[&OsStr]| {
+            let mut cmd = self.git.command(args);
+            cmd.env("GIT_INDEX_FILE", &index);
+            exec(cmd)
+        };
+        let source = format!("--source={id}");
+        with_index(&["read-tree".as_ref(), "HEAD".as_ref()])?;
+        with_index(&[
+            "restore".as_ref(),
+            "--staged".as_ref(),
+            source.as_ref(),
+            "--".as_ref(),
+            path.as_os_str(),
+        ])?;
+        let tree = with_index(&["write-tree".as_ref()])?;
+        fs::remove_file(&index)?;
+        Ok(tree.trim_end().to_owned())
     }
 
     /// Watches the folder and commits each burst of edits once it settles.
