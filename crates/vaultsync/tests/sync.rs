@@ -667,19 +667,23 @@ fn a_rename_made_while_a_sync_lands_is_kept() {
 #[test]
 fn a_restarted_machine_s_edits_reach_its_peers_promptly() {
     let mut mesh = Mesh::new(2);
-    mesh.start_all();
-    mesh.converged(20);
-    // Catching up every second, the peer is usually mid-request to the old
-    // instance when it dies.
-    for round in 0..3 {
-        mesh.nodes[0].stop();
-        mesh.start(0);
-        let text = format!("after restart {round}\n");
-        mesh.nodes[0].write("a.md", &text);
-        assert!(
-            wait_until(15, || mesh.nodes[1].read("a.md").as_deref() == Some(&text)),
-            "restart {round}: the edit took over 15 s:\n{}",
-            mesh.logs()
-        );
-    }
+    let addrs = mesh.addrs.clone();
+    mesh.start(1);
+    mesh.nodes[0].start_with(&addrs, Some("stall-serving"));
+    // m1 is mid-request to this instance, which never answers, when it dies.
+    assert!(
+        wait_until(10, || mesh.nodes[0]
+            .log_text()
+            .contains("test hook: stall-serving")),
+        "{}",
+        mesh.logs()
+    );
+    mesh.nodes[0].stop();
+    mesh.start(0);
+    mesh.nodes[0].write("a.md", "after the restart\n");
+    assert!(
+        wait_until(AFTER_RESTART, || mesh.nodes[1].read("a.md").is_some()),
+        "the edit took over {AFTER_RESTART} s:\n{}",
+        mesh.logs()
+    );
 }
