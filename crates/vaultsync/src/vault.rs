@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -446,29 +446,22 @@ impl Vault {
             .value(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])?;
         let short = self.git.value(["rev-parse", "--short", &id])?;
         self.commit_pending_locked()?;
-        let members = Path::new(MEMBERS_PATH);
-        let (tree, what) = match path {
-            // A rollback never undoes a membership change: the list stays as it is now.
-            None if self.has(&id, members) || self.has("HEAD", members) => {
-                (self.tree_with(&id, "HEAD", members)?, "vault".to_owned())
-            }
+        let (mut tree, what) = match path {
             None => (
                 self.git.value(["rev-parse", &format!("{id}^{{tree}}")])?,
                 "vault".to_owned(),
             ),
-            Some(path)
-                if path
-                    .components()
-                    .find(|c| matches!(c, Component::Normal(_)))
-                    == Some(Component::Normal(".vault".as_ref())) =>
-            {
-                bail!("the member list changes only through `member add` and `remove`")
-            }
             Some(path) => (
                 self.tree_with("HEAD", &id, path)?,
                 path.display().to_string(),
             ),
         };
+        // A rollback never undoes a membership change, whatever it selects:
+        // the member list stays as it is now.
+        let members = Path::new(MEMBERS_PATH);
+        if self.has(&tree, members) || self.has("HEAD", members) {
+            tree = self.tree_with(&tree, "HEAD", members)?;
+        }
         // Git overwrites ignored files freely; refuse instead.
         let added = self.git.run([
             "diff",

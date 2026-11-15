@@ -257,9 +257,15 @@ fn rollback_never_changes_the_member_list() {
         "{members}"
     );
 
-    let direct = vaultsync(&m0.folder, &["rollback", &start, ".vault/members"]);
-    assert!(!direct.status.success());
-    assert!(String::from_utf8_lossy(&direct.stderr).contains("member add"));
+    // Nor when the selection takes it in.
+    for path in [".vault/members", "."] {
+        let _ = vaultsync(&m0.folder, &["rollback", &start, path]);
+        let after = m0.read(".vault/members").unwrap();
+        assert!(
+            after.contains(&format!("removed {} gone", gone.id)),
+            "{path}: {after}"
+        );
+    }
 }
 
 #[test]
@@ -283,6 +289,18 @@ fn a_fetch_that_began_before_a_removal_gets_nothing_after_it() {
 
     std::thread::sleep(Duration::from_secs(8));
     assert_eq!(mesh.nodes[1].read("secret.md"), None, "{}", mesh.logs());
+    // Not even its contents reached m1's history.
+    let gd0 = format!("--git-dir={}.git", mesh.nodes[0].folder.display());
+    let blob = git(
+        &mesh.nodes[0].folder,
+        &[&gd0, "rev-parse", "HEAD:secret.md"],
+    );
+    let in_m1 = std::process::Command::new("git")
+        .arg(format!("--git-dir={}.git", mesh.nodes[1].folder.display()))
+        .args(["cat-file", "-e", blob.trim()])
+        .status()
+        .unwrap();
+    assert!(!in_m1.success(), "m1 received the secret's contents");
     assert!(
         mesh.nodes[0].log_text().contains("is no longer a member"),
         "{}",
