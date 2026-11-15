@@ -68,6 +68,17 @@ impl Node {
         }
     }
 
+    /// Waits until the daemon has committed every edit.
+    fn committed(&self) {
+        let clean = || ok(&self.folder, &["status"]).contains("0 uncommitted changes");
+        assert!(
+            wait_until(10, clean),
+            "{} kept uncommitted edits:\n{}",
+            self.name,
+            self.log_text()
+        );
+    }
+
     fn log_text(&self) -> String {
         fs::read_to_string(&self.log).unwrap_or_default()
     }
@@ -231,6 +242,7 @@ fn concurrent_offline_edits_merge_or_keep_both() {
     mesh.nodes[0].write("same.md", "one\n");
     mesh.nodes[0].write("gone.md", "keep me\n");
     mesh.nodes[0].write("old-name.md", "a\nb\nc\nd\n");
+    mesh.nodes[0].write(".gitattributes", "*.pdf binary\n");
     mesh.start_all();
     mesh.converged(20);
     mesh.stop_all();
@@ -247,12 +259,23 @@ fn concurrent_offline_edits_merge_or_keep_both() {
     b.write("old-name.md", "a\nb\nc\nD\n");
     fs::write(a.folder.join("pic.png"), b"\x89PNG\0from a").unwrap();
     fs::write(b.folder.join("pic.png"), b"\x89PNG\0from b").unwrap();
-    let (extra_a, extra_b) = (
-        Node::new(mesh._tmp.path(), "extra-a"),
-        Node::new(mesh._tmp.path(), "extra-b"),
-    );
+    // Two new members whose ids sort into the same place in the list, so the
+    // concurrent additions touch the same lines.
+    let gap = |n: &Node| mesh.nodes.iter().filter(|m| m.id < n.id).count();
+    let extra_a = Node::new(mesh._tmp.path(), "extra-a");
+    let extra_b = (0..40)
+        .map(|i| Node::new(mesh._tmp.path(), &format!("extra-b{i}")))
+        .find(|b| gap(b) == gap(&extra_a))
+        .unwrap();
     a.trust(&extra_a);
     b.trust(&extra_b);
+    // No NUL bytes, but marked binary: git won't mark it, so both must stay.
+    a.write("doc.pdf", "%PDF from a\n");
+    b.write("doc.pdf", "%PDF from b\n");
+    // Vaults made before the members merge rule was written at init.
+    for n in &mesh.nodes {
+        fs::remove_file(format!("{}.git/info/attributes", n.folder.display())).unwrap();
+    }
 
     mesh.start_all();
     mesh.converged(30);
@@ -290,6 +313,14 @@ fn concurrent_offline_edits_merge_or_keep_both() {
         pics,
         vec![b"\x89PNG\0from a".to_vec(), b"\x89PNG\0from b".to_vec()]
     );
+    let mut docs: Vec<String> = fs::read_dir(&n.folder)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("doc"))
+        .map(|p| fs::read_to_string(p).unwrap())
+        .collect();
+    docs.sort();
+    assert_eq!(docs, ["%PDF from a\n", "%PDF from b\n"]);
     let members = n.read(".vault/members").unwrap();
     assert!(
         members.contains(&extra_a.id)
@@ -311,43 +342,100 @@ fn concurrent_offline_edits_merge_or_keep_both() {
     mesh.converged(20);
 }
 
-#[test]
-fn edit_made_during_an_interrupted_sync_survives() {
-    let mut mesh = Mesh::new(2);
-    mesh.nodes[1].write("from-b.md", "b\n");
-    mesh.start(1);
-    // m0 dies after writing m1's files but before moving HEAD.
-    let addrs = mesh.addrs.clone();
-    mesh.nodes[0].start_with(&addrs, Some("crash-mid-apply"));
-    let a = &mut mesh.nodes[0];
-    assert!(
-        wait_until(20, || a
-            .daemon
-            .as_mut()
-            .unwrap()
-            .try_wait()
-            .unwrap()
-            .is_some()),
-        "never crashed:\n{}",
-        a.log_text()
-    );
-    a.daemon = None;
-    assert_eq!(a.read("from-b.md").as_deref(), Some("b\n"));
+/// After a restart, peers reach the daemon again once iroh drops the dead
+/// instance's path (up to 15 s idle) and a dial that went there times out.
+const AFTER_RESTART: u64 = 45;
 
-    a.write("during.md", "written while the sync was interrupted\n");
-    mesh.start(0);
-    assert!(
-        wait_until(20, || mesh.nodes[1].read("during.md").is_some()),
-        "{}",
-        mesh.logs()
-    );
+/// Waits for a daemon started with a crash hook to die.
+fn crashed(node: &mut Node) {
+    let died = wait_until(20, || {
+        node.daemon.as_mut().unwrap().try_wait().unwrap().is_some()
+    });
+    assert!(died, "never crashed:\n{}", node.log_text());
+    node.daemon = None;
+}
+
+#[test]
+fn what_a_user_does_after_an_interrupted_sync_survives() {
+    let mut mesh = Mesh::new(2);
+    mesh.nodes[0].write("shared.md", "v1\n");
+    mesh.start_all();
     mesh.converged(20);
-    let log = ok(&mesh.nodes[0].folder, &["log"]);
-    assert!(
-        log.contains("Update during.md") && log.contains("Merge"),
-        "{log}"
-    );
-    assert_eq!(mesh.nodes[0].read("from-b.md").as_deref(), Some("b\n"));
+    mesh.nodes[0].stop();
+    mesh.nodes[1].write("shared.md", "v2\n");
+    mesh.nodes[1].write("added.md", "from b\n");
+    mesh.nodes[1].committed();
+
+    // m0 writes m1's changes to disk, then dies before moving HEAD.
+    let addrs = mesh.addrs.clone();
+    mesh.nodes[0].start_with(&addrs, Some("crash-after-worktree"));
+    crashed(&mut mesh.nodes[0]);
+    let a = &mesh.nodes[0];
+    assert_eq!(a.read("added.md").as_deref(), Some("from b\n"));
+    // While it is down, the user deletes the new note, reverts the changed
+    // one, and writes another.
+    fs::remove_file(a.folder.join("added.md")).unwrap();
+    a.write("shared.md", "v1\n");
+    a.write("during.md", "written while the sync was interrupted\n");
+
+    mesh.start(0);
+    mesh.converged(AFTER_RESTART);
+    for n in &mesh.nodes {
+        assert_eq!(
+            n.read("added.md"),
+            None,
+            "{}: the delete was undone",
+            n.name
+        );
+        assert_eq!(
+            n.read("shared.md").as_deref(),
+            Some("v1\n"),
+            "{}: the revert was undone",
+            n.name
+        );
+        assert!(n.read("during.md").is_some(), "{}", n.name);
+    }
+}
+
+#[test]
+fn a_rename_interrupted_halfway_does_not_bring_back_the_old_note() {
+    let mut mesh = Mesh::new(2);
+    mesh.nodes[0].write("old.md", "note\n");
+    mesh.start_all();
+    mesh.converged(20);
+    mesh.nodes[0].stop();
+    let b = &mesh.nodes[1];
+    fs::rename(b.folder.join("old.md"), b.folder.join("new.md")).unwrap();
+    mesh.nodes[1].committed();
+
+    // m0 dies as git starts writing m1's rename: the new name is on disk,
+    // the old one not yet removed.
+    let addrs = mesh.addrs.clone();
+    mesh.nodes[0].start_with(&addrs, Some("crash-before-worktree"));
+    crashed(&mut mesh.nodes[0]);
+    mesh.nodes[0].write("new.md", "note\n");
+
+    mesh.start(0);
+    mesh.converged(AFTER_RESTART);
+    for n in &mesh.nodes {
+        assert_eq!(n.read("old.md"), None, "{}: the old note came back", n.name);
+        assert_eq!(n.read("new.md").as_deref(), Some("note\n"), "{}", n.name);
+    }
+}
+
+#[test]
+fn a_stalled_peer_does_not_hold_up_local_commits() {
+    let mut mesh = Mesh::new(2);
+    let addrs = mesh.addrs.clone();
+    mesh.nodes[1].start_with(&addrs, Some("stall-serving"));
+    mesh.start(0);
+    // m0's catch-up is now waiting on m1, which never answers.
+    std::thread::sleep(Duration::from_secs(2));
+    mesh.nodes[0].write("note.md", "saved during a stalled fetch\n");
+    let committed = wait_until(5, || {
+        ok(&mesh.nodes[0].folder, &["log", "-n", "1"]).contains("Update note.md")
+    });
+    assert!(committed, "{}", mesh.logs());
 }
 
 #[test]

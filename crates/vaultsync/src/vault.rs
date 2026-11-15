@@ -94,20 +94,7 @@ impl Vault {
             None => gethostname::gethostname().to_string_lossy().into_owned(),
         };
         vault.git.run(["config", MACHINE_KEY, &machine])?;
-        // Concurrent member additions merge as a union, never as markers.
-        let attributes = beside.join("info").join("attributes");
-        let rule = format!("{MEMBERS_PATH} merge=union\n");
-        if !fs::read_to_string(&attributes)
-            .unwrap_or_default()
-            .contains(&rule)
-        {
-            fs::create_dir_all(attributes.parent().expect("has a parent"))?;
-            fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&attributes)?
-                .write_all(rule.as_bytes())?;
-        }
+        vault.ensure_union_merge()?;
         if fresh {
             vault.git.run(["add", "-A"])?;
             vault.commit("Initialize vault")?;
@@ -121,10 +108,29 @@ impl Vault {
         for dir in start.ancestors() {
             let vault = Vault::at(dir.to_owned());
             if vault.git.git_dir.is_dir() && vault.machine().is_ok() {
+                vault.ensure_union_merge()?;
                 return Ok(vault);
             }
         }
         bail!("no vault at or above {}", start.display())
+    }
+
+    /// Concurrent member additions merge as a union, never as markers.
+    fn ensure_union_merge(&self) -> Result<()> {
+        let attributes = self.git.git_dir.join("info").join("attributes");
+        let rule = format!("{MEMBERS_PATH} merge=union\n");
+        if !fs::read_to_string(&attributes)
+            .unwrap_or_default()
+            .contains(&rule)
+        {
+            fs::create_dir_all(attributes.parent().expect("has a parent"))?;
+            fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&attributes)?
+                .write_all(rule.as_bytes())?;
+        }
+        Ok(())
     }
 
     fn machine(&self) -> Result<String> {
@@ -429,62 +435,51 @@ impl Vault {
     }
 
     /// Moves HEAD, index and work tree from `old` to `new`. False if a file
-    /// git would change was edited meanwhile; nothing is touched then.
+    /// git would change was edited meanwhile; nothing is touched then. The
+    /// intent file records how far it got, for `recover`.
     fn apply(&self, old: &str, new: &str) -> Result<bool> {
         let intent = self.state("apply")?;
-        fs::write(&intent, format!("{old} {new}\n"))?;
+        fs::write(&intent, format!("started {old} {new}\n"))?;
+        crash_if_hooked("crash-before-worktree");
         if self.git.run(["read-tree", "-m", "-u", old, new]).is_err() {
             fs::remove_file(&intent)?;
             return Ok(false);
         }
-        if std::env::var("VAULTSYNC_TEST_HOOK").as_deref() == Ok("crash-mid-apply") {
-            std::process::exit(9);
-        }
+        fs::write(&intent, format!("written {old} {new}\n"))?;
+        crash_if_hooked("crash-after-worktree");
         self.git.run(["update-ref", "HEAD", new, old])?;
         fs::remove_file(&intent)?;
         Ok(true)
     }
 
-    /// Finishes an `apply` a crash interrupted: files still at `old` move to
-    /// `new`; files that differ from both are edits, kept for the next commit.
+    /// Settles an `apply` a crash interrupted, never undoing what a user did
+    /// since. Once the work tree was fully written only HEAD is left to move,
+    /// and any difference from `new` is the user's. Before that, git may have
+    /// written part of `new`: HEAD stays at `old`, and whatever is on disk is
+    /// committed as an edit and merged again.
     fn recover(&self) -> Result<()> {
         let intent = self.state("apply")?;
         let Ok(text) = fs::read_to_string(&intent) else {
             return Ok(());
         };
-        let (old, new) = text
-            .trim()
-            .split_once(' ')
-            .context("corrupt apply intent")?;
-        if self.head()? == old {
-            self.git.run(["read-tree", new])?;
-            let changed = self.git.run(["diff", "--name-only", "-z", old, new])?;
-            for path in changed.split('\0').filter(|p| !p.is_empty()) {
-                let file = self.folder().join(path);
-                let was = self
-                    .git
-                    .value(["rev-parse", "-q", "--verify", &format!("{old}:{path}")])
-                    .ok();
-                let is = file
-                    .exists()
-                    .then(|| self.git.value(["hash-object", "--", path]).ok())
-                    .flatten();
-                if is != was {
-                    continue;
-                }
-                if self
-                    .git
-                    .run(["cat-file", "-e", &format!("{new}:{path}")])
-                    .is_ok()
-                {
-                    self.git.run(["checkout-index", "-f", "--", path])?;
-                } else if file.exists() {
-                    fs::remove_file(&file)?;
-                }
-            }
+        let [phase, old, new] = text.split_whitespace().collect::<Vec<_>>()[..] else {
+            bail!("corrupt apply intent: {text}");
+        };
+        if phase == "written" && self.head()? == old {
             self.git.run(["update-ref", "HEAD", new, old])?;
         }
         fs::remove_file(&intent)?;
         Ok(())
+    }
+}
+
+/// Fault injection for tests: `VAULTSYNC_TEST_HOOK=<name>`.
+pub fn hooked(name: &str) -> bool {
+    std::env::var("VAULTSYNC_TEST_HOOK").as_deref() == Ok(name)
+}
+
+fn crash_if_hooked(name: &str) {
+    if hooked(name) {
+        std::process::exit(9);
     }
 }
