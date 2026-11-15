@@ -12,7 +12,7 @@
 #       stop and remove the service; the binary and the vault stay
 set -eu
 
-REPO=srosro/vaultsync
+REPO=plow-pbc/vaultsync
 BASE=${VAULTSYNC_DOWNLOAD:-https://github.com/$REPO/releases/latest/download}
 BIN_DIR=${VAULTSYNC_BIN_DIR:-$HOME/.local/bin}
 BIN=$BIN_DIR/vaultsync
