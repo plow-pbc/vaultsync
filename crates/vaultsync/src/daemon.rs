@@ -54,7 +54,8 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
     // Catch edits made while nothing was watching.
     let mut retry = Retry::default();
     let mut fetches = Fetches::default();
-    edited(&vault, &net, &mut retry).await;
+    let mut announced = None;
+    edited(&vault, &net, &mut retry, &mut announced).await;
     eprintln!(
         "watching {} as node {}",
         vault.folder().display(),
@@ -73,7 +74,7 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
             _ = tokio::time::sleep_until(deadline), if retry.at.is_some() => Event::Edited,
         };
         match event {
-            Event::Edited => edited(&vault, &net, &mut retry).await,
+            Event::Edited => edited(&vault, &net, &mut retry, &mut announced).await,
             Event::Poke(peer) => fetches.start(&vault, &net, &events, peer, true),
             Event::CatchUp => {
                 for peer in blocking(&vault, Vault::peers).await.unwrap_or_default() {
@@ -85,7 +86,7 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
                     continue;
                 }
                 match result {
-                    Ok(()) => integrate(&vault, &net, peer).await,
+                    Ok(()) => integrate(&vault, &net, peer, &mut announced).await,
                     Err(e) => eprintln!("could not fetch from {}: {e:#}", peer.fmt_short()),
                 }
             }
@@ -110,14 +111,16 @@ struct Retry {
 }
 
 /// Commits pending edits; on failure sets the next retry deadline.
-async fn edited(vault: &Vault, net: &Net, retry: &mut Retry) {
+async fn edited(vault: &Vault, net: &Net, retry: &mut Retry, announced: &mut Option<String>) {
     match blocking(vault, Vault::commit_pending).await {
         Ok(id) => {
             *retry = Retry::default();
             if let Some(id) = id {
                 eprintln!("committed {id}");
-                poke_all(vault, net).await;
             }
+            // Also covers commits made outside the watcher: member changes,
+            // rollbacks, a newcomer admitted.
+            announce(vault, net, announced).await;
         }
         Err(e) => {
             let wait = retry.wait.map_or(Duration::from_secs(1), |w| {
@@ -193,18 +196,24 @@ impl Fetches {
     }
 }
 
-async fn integrate(vault: &Vault, net: &Net, peer: EndpointId) {
+async fn integrate(vault: &Vault, net: &Net, peer: EndpointId, announced: &mut Option<String>) {
     match blocking(vault, move |v| v.integrate(&peer)).await {
         Ok(Some(head)) => {
             eprintln!("synced {} from {}", &head[..7], peer.fmt_short());
-            poke_all(vault, net).await;
+            announce(vault, net, announced).await;
         }
         Ok(None) => {}
         Err(e) => eprintln!("{e:#}"),
     }
 }
 
-async fn poke_all(vault: &Vault, net: &Net) {
+/// Pokes every other member if HEAD moved since the last poke.
+async fn announce(vault: &Vault, net: &Net, announced: &mut Option<String>) {
+    let head = blocking(vault, Vault::head).await.ok();
+    if head == *announced {
+        return;
+    }
+    *announced = head;
     for peer in blocking(vault, Vault::peers).await.unwrap_or_default() {
         let net = net.clone();
         tokio::spawn(async move { net.poke(peer).await });
