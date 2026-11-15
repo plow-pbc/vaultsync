@@ -467,7 +467,7 @@ impl Vault {
 
     /// Restores the whole vault, or one path, to its state at `rev` as a new
     /// commit. Pending edits are committed first, so nothing is lost.
-    pub fn rollback(&self, rev: &str, path: Option<&Path>) -> Result<String> {
+    pub fn rollback(&self, rev: &str, paths: &[PathBuf]) -> Result<String> {
         let _lock = self.lock()?;
         // Resolve first: the checkpoint below moves HEAD, and with it `HEAD~1`.
         let id = self
@@ -475,21 +475,20 @@ impl Vault {
             .value(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])?;
         let short = self.git.value(["rev-parse", "--short", &id])?;
         self.commit_pending_locked()?;
-        let (mut tree, what) = match path {
-            None => (
+        let (mut tree, what) = if paths.is_empty() {
+            (
                 self.git.value(["rev-parse", &format!("{id}^{{tree}}")])?,
                 "vault".to_owned(),
-            ),
-            Some(path) => (
-                self.tree_with("HEAD", &id, path)?,
-                path.display().to_string(),
-            ),
+            )
+        } else {
+            let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+            (self.tree_with("HEAD", &id, paths)?, names.join(", "))
         };
         // A rollback never undoes a membership change, whatever it selects:
         // the member list stays as it is now.
         let members = Path::new(MEMBERS_PATH);
         if self.has(&tree, members) || self.has("HEAD", members) {
-            tree = self.tree_with(&tree, "HEAD", members)?;
+            tree = self.tree_with(&tree, "HEAD", &[members.to_owned()])?;
         }
         // Git overwrites ignored files freely; refuse instead.
         let added = self.git.run([
@@ -546,7 +545,8 @@ impl Vault {
             .is_ok()
     }
 
-    fn tree_with(&self, base: &str, id: &str, path: &Path) -> Result<String> {
+    /// `base`'s tree with `paths` as they are at `id`.
+    fn tree_with(&self, base: &str, id: &str, paths: &[PathBuf]) -> Result<String> {
         let index = self.git.git_dir.join("vaultsync-rollback-index");
         let with_index = |args: &[&OsStr]| {
             let mut cmd = self.git.command(args);
@@ -555,13 +555,14 @@ impl Vault {
         };
         let source = format!("--source={id}");
         with_index(&["read-tree".as_ref(), base.as_ref()])?;
-        with_index(&[
+        let mut restore: Vec<&OsStr> = vec![
             "restore".as_ref(),
             "--staged".as_ref(),
             source.as_ref(),
             "--".as_ref(),
-            path.as_os_str(),
-        ])?;
+        ];
+        restore.extend(paths.iter().map(|p| p.as_os_str()));
+        with_index(&restore)?;
         let tree = with_index(&["write-tree".as_ref()])?;
         fs::remove_file(&index)?;
         Ok(tree.trim_end().to_owned())

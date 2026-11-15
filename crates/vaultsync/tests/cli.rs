@@ -264,6 +264,51 @@ fn edit_becomes_commit_within_seconds() {
 }
 
 #[test]
+fn rollback_of_several_paths_is_one_commit_or_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("notes");
+    fs::create_dir_all(folder.join("people")).unwrap();
+    fs::write(folder.join("people/ada.md"), "v1\n").unwrap();
+    fs::write(folder.join("hot.md"), "v1\n").unwrap();
+    fs::write(folder.join("other.md"), "v1\n").unwrap();
+    init(&folder);
+    let first = ok(&folder, &["log"])
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    for f in ["people/ada.md", "hot.md", "other.md"] {
+        fs::write(folder.join(f), "v2\n").unwrap();
+    }
+    fs::write(folder.join("people/new.md"), "made since\n").unwrap();
+    let read = |f: &str| fs::read_to_string(folder.join(f)).ok();
+    let commits = || ok(&folder, &["log"]).lines().count();
+
+    // A path that exists at neither commit: nothing is rolled back.
+    let out = vaultsync(&folder, &["rollback", &first, "people", "nowhere"]);
+    assert!(!out.status.success());
+    assert_eq!(read("people/ada.md").as_deref(), Some("v2\n"));
+    assert!(read("people/new.md").is_some());
+    let before = commits();
+
+    // Both paths in one commit; what's outside them stays.
+    ok(&folder, &["rollback", &first, "people", "hot.md"]);
+    assert_eq!(read("people/ada.md").as_deref(), Some("v1\n"));
+    assert_eq!(read("people/new.md"), None);
+    assert_eq!(read("hot.md").as_deref(), Some("v1\n"));
+    assert_eq!(read("other.md").as_deref(), Some("v2\n"));
+    assert_eq!(commits(), before + 1);
+    let log = ok(&folder, &["log"]);
+    assert!(
+        log.lines()
+            .next()
+            .unwrap()
+            .contains(&format!("Roll back people, hot.md to {first}")),
+        "{log}"
+    );
+}
+
+#[test]
 fn rollback_restores_prior_version_as_new_commit() {
     let tmp = tempfile::tempdir().unwrap();
     let folder = tmp.path().join("notes");
