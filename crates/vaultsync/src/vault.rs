@@ -61,6 +61,15 @@ impl Vault {
         let vault = Vault::at(folder.canonicalize()?);
         let inner = vault.folder().join(".git");
         let beside = &vault.git.git_dir;
+        // Check existing history before moving anything.
+        for git_dir in [&inner, beside].into_iter().filter(|d| d.is_dir()) {
+            let git = Git {
+                git_dir: git_dir.clone(),
+                work_tree: vault.folder().to_owned(),
+            };
+            git.run(["symbolic-ref", "-q", "HEAD"])
+                .with_context(|| format!("HEAD in {} must be on a branch", git_dir.display()))?;
+        }
         match (fs::symlink_metadata(&inner).ok(), beside.exists()) {
             (Some(meta), false) if meta.is_dir() => {
                 fs::rename(&inner, beside).context("moving .git beside the folder")?
@@ -80,10 +89,6 @@ impl Vault {
         if !fresh && !beside.join("index").exists() {
             vault.git.run(["read-tree", "HEAD"])?;
         }
-        vault
-            .git
-            .run(["symbolic-ref", "-q", "HEAD"])
-            .context("HEAD must be on a branch")?;
         let machine = match machine {
             Some(m) => m,
             None => gethostname::gethostname().to_string_lossy().into_owned(),
@@ -264,17 +269,58 @@ impl Vault {
     /// commit. Pending edits are committed first, so nothing is lost.
     pub fn rollback(&self, rev: &str, path: Option<&Path>) -> Result<String> {
         let _lock = self.lock()?;
-        self.commit_pending_locked()?;
+        // Resolve first: the checkpoint below moves HEAD, and with it `HEAD~1`.
         let id = self
             .git
             .value(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])?;
         let short = self.git.value(["rev-parse", "--short", &id])?;
+        self.commit_pending_locked()?;
+        // Git overwrites ignored files freely; refuse instead.
+        let mut added = self.git.command([
+            "diff",
+            "--name-only",
+            "-z",
+            "--diff-filter=A",
+            "HEAD",
+            &id,
+            "--",
+        ]);
+        added.args(path);
+        let added = exec(added)?;
+        let ignored = self.git.run([
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+        ])?;
+        let ignored: Vec<&str> = ignored.split('\0').filter(|f| !f.is_empty()).collect();
+        // The same path, or one inside the other (a file where a folder was).
+        let overlaps = |a: &str, b: &str| {
+            a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+        };
+        let clash: Vec<&str> = added
+            .split('\0')
+            .filter(|f| !f.is_empty() && ignored.iter().any(|i| overlaps(f, i)))
+            .collect();
+        if !clash.is_empty() {
+            bail!(
+                "rollback would overwrite untracked files: {}; move them aside",
+                clash.join(", ")
+            );
+        }
+        // Both restores also refuse to overwrite a file saved since the checkpoint.
         let target = match path {
             None => {
-                self.git.run(["read-tree", "-u", "--reset", &id])?;
+                self.git
+                    .run(["read-tree", "-m", "-u", "HEAD", &id])
+                    .context("files changed during rollback; try again")?;
                 "vault".to_owned()
             }
             Some(path) => {
+                let mut changed = self.git.command(["diff", "--quiet", "--"]);
+                changed.arg(path);
+                exec(changed).context("file changed during rollback; try again")?;
                 let mut cmd = self.git.command(["restore", "--staged", "--worktree"]);
                 cmd.arg(format!("--source={id}")).arg("--").arg(path);
                 exec(cmd)?;

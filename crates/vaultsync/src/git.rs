@@ -24,6 +24,7 @@ impl Git {
             .arg("--work-tree")
             .arg(&self.work_tree)
             .args(["-c", "commit.gpgsign=false", "-c", "core.quotepath=false"])
+            .args(["-c", "core.hooksPath=/dev/null"])
             .args(args)
             .current_dir(&self.work_tree);
         // Inherited from a parent git process (a hook, say), these would point git elsewhere.
