@@ -1,170 +1,9 @@
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 mod common;
-use common::{git, ok, wait_until};
-
-/// One machine: a vault folder and, while running, its daemon.
-struct Node {
-    folder: PathBuf,
-    name: String,
-    id: String,
-    log: PathBuf,
-    daemon: Option<Child>,
-}
-
-impl Node {
-    fn new(root: &Path, name: &str) -> Node {
-        let folder = root.join(name);
-        ok(root, &["init", folder.to_str().unwrap(), "--machine", name]);
-        let id = ok(&folder, &["id"]).trim().to_owned();
-        Node {
-            log: root.join(format!("{name}.log")),
-            folder,
-            name: name.into(),
-            id,
-            daemon: None,
-        }
-    }
-
-    fn trust(&self, other: &Node) {
-        ok(
-            &self.folder,
-            &["member", "add", &other.id, "--name", &other.name],
-        );
-    }
-
-    fn start_with(&mut self, addrs: &Path, hook: Option<&str>) {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_vaultsync"));
-        cmd.arg("--vault")
-            .arg(&self.folder)
-            .args(["run", "--catch-up", "1", "--addr-dir"])
-            .arg(addrs);
-        if let Some(hook) = hook {
-            cmd.env("VAULTSYNC_TEST_HOOK", hook);
-        }
-        let log = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log)
-            .unwrap();
-        // The log spans restarts: wait for this start's line, not an old one.
-        let started = format!("as node {}", self.id);
-        let before = self.log_text().matches(&started).count();
-        self.daemon = Some(cmd.stderr(log).stdout(Stdio::null()).spawn().unwrap());
-        assert!(
-            wait_until(10, || self.log_text().matches(&started).count() > before),
-            "{} never started:\n{}",
-            self.name,
-            self.log_text()
-        );
-    }
-
-    fn stop(&mut self) {
-        if let Some(mut d) = self.daemon.take() {
-            d.kill().unwrap();
-            d.wait().unwrap();
-        }
-    }
-
-    /// Waits until the daemon has committed every edit.
-    fn committed(&self) {
-        let clean = || ok(&self.folder, &["status"]).contains("0 uncommitted changes");
-        assert!(
-            wait_until(10, clean),
-            "{} kept uncommitted edits:\n{}",
-            self.name,
-            self.log_text()
-        );
-    }
-
-    fn log_text(&self) -> String {
-        fs::read_to_string(&self.log).unwrap_or_default()
-    }
-
-    fn head(&self) -> String {
-        git(
-            Path::new("."),
-            &[
-                &format!("--git-dir={}.git", self.folder.display()),
-                "rev-parse",
-                "HEAD",
-            ],
-        )
-    }
-
-    fn read(&self, path: &str) -> Option<String> {
-        fs::read_to_string(self.folder.join(path)).ok()
-    }
-
-    fn write(&self, path: &str, text: &str) {
-        let file = self.folder.join(path);
-        fs::create_dir_all(file.parent().unwrap()).unwrap();
-        fs::write(file, text).unwrap();
-    }
-}
-
-impl Drop for Node {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// `n` machines that each added every other one by hand.
-struct Mesh {
-    _tmp: tempfile::TempDir,
-    addrs: PathBuf,
-    nodes: Vec<Node>,
-}
-
-impl Mesh {
-    fn new(n: usize) -> Mesh {
-        let tmp = tempfile::tempdir().unwrap();
-        let addrs = tmp.path().join("addrs");
-        fs::create_dir(&addrs).unwrap();
-        let nodes: Vec<Node> = (0..n)
-            .map(|i| Node::new(tmp.path(), &format!("m{i}")))
-            .collect();
-        for a in &nodes {
-            for b in nodes.iter().filter(|b| b.id != a.id) {
-                a.trust(b);
-            }
-        }
-        Mesh {
-            _tmp: tmp,
-            addrs,
-            nodes,
-        }
-    }
-
-    fn start(&mut self, i: usize) {
-        self.nodes[i].start_with(&self.addrs.clone(), None);
-    }
-
-    fn start_all(&mut self) {
-        (0..self.nodes.len()).for_each(|i| self.start(i));
-    }
-
-    fn stop_all(&mut self) {
-        self.nodes.iter_mut().for_each(Node::stop);
-    }
-
-    /// Waits for every machine to have the same head, and returns it.
-    fn converged(&self, secs: u64) -> String {
-        let same = || self.nodes.iter().all(|n| n.head() == self.nodes[0].head());
-        assert!(wait_until(secs, same), "no convergence:\n{}", self.logs());
-        self.nodes[0].head()
-    }
-
-    fn logs(&self) -> String {
-        self.nodes
-            .iter()
-            .map(|n| format!("--- {}\n{}", n.name, n.log_text()))
-            .collect()
-    }
-}
+use common::{AFTER_RESTART, Mesh, Node, git, ok, wait_until};
 
 #[test]
 fn edits_reach_every_member_and_heads_settle() {
@@ -247,7 +86,7 @@ fn concurrent_offline_edits_merge_or_keep_both() {
     // concurrent additions touch the same lines.
     let gap = |n: &Node| mesh.nodes.iter().filter(|m| m.id < n.id).count();
     let extra_a = Node::new(mesh._tmp.path(), "extra-a");
-    let extra_b = (0..40)
+    let extra_b = (0..)
         .map(|i| Node::new(mesh._tmp.path(), &format!("extra-b{i}")))
         .find(|b| gap(b) == gap(&extra_a))
         .unwrap();
@@ -325,10 +164,6 @@ fn concurrent_offline_edits_merge_or_keep_both() {
     );
     mesh.converged(20);
 }
-
-/// After a restart, peers reach the daemon again once iroh drops the dead
-/// instance's path (up to 15 s idle) and a dial that went there times out.
-const AFTER_RESTART: u64 = 45;
 
 /// Waits for a daemon started with a crash hook to die.
 fn crashed(node: &mut Node) {
@@ -429,34 +264,57 @@ fn a_stalled_peer_does_not_hold_up_local_commits() {
 }
 
 #[test]
-fn unsigned_member_change_is_refused() {
-    let mut mesh = Mesh::new(2);
-    let rogue = Node::new(mesh._tmp.path(), "rogue");
-    // m1's history gains a member change made without vaultsync's signature.
-    let b = &mesh.nodes[1];
-    let mut members = b.read(".vault/members").unwrap();
-    members.push_str(&format!("{} rogue\n", rogue.id));
-    b.write(".vault/members", &members);
-    b.write("smuggled.md", "x\n");
-    let gd = format!("--git-dir={}.git", b.folder.display());
-    let wt = format!("--work-tree={}", b.folder.display());
-    git(&b.folder, &[&gd, &wt, "add", "-A"]);
-    git(&b.folder, &[&gd, &wt, "commit", "-qm", "sneak a member in"]);
+fn history_vaultsync_did_not_write_is_refused() {
+    for forgery in ["unsigned commit", "doctored merge"] {
+        let mut mesh = Mesh::new(2);
+        let rogue = Node::new(mesh._tmp.path(), "rogue");
+        // m1's history gains a member and a file vaultsync never signed.
+        let b = &mesh.nodes[1];
+        let mut members = b.read(".vault/members").unwrap();
+        members.push_str(&format!("{} rogue\n", rogue.id));
+        b.write(".vault/members", &members);
+        b.write("smuggled.md", "x\n");
+        let gd = format!("--git-dir={}.git", b.folder.display());
+        let wt = format!("--work-tree={}", b.folder.display());
+        git(&b.folder, &[&gd, &wt, "add", "-A"]);
+        if forgery == "unsigned commit" {
+            git(&b.folder, &[&gd, &wt, "commit", "-qm", "sneak a member in"]);
+        } else {
+            // Dressed as a merge of two real commits, but with its own tree.
+            let tree = git(&b.folder, &[&gd, &wt, "write-tree"]);
+            let merge = git(
+                &b.folder,
+                &[
+                    &gd,
+                    "commit-tree",
+                    tree.trim(),
+                    "-p",
+                    "HEAD",
+                    "-p",
+                    "HEAD~1",
+                    "-m",
+                    "Merge",
+                ],
+            );
+            git(&b.folder, &[&gd, "update-ref", "HEAD", merge.trim()]);
+        }
 
-    mesh.start_all();
-    let refused = format!("refusing history from {}", &mesh.nodes[1].id[..10]);
-    assert!(
-        wait_until(15, || mesh.nodes[0].log_text().contains(&refused)),
-        "{}",
-        mesh.logs()
-    );
-    assert_eq!(mesh.nodes[0].read("smuggled.md"), None);
-    assert!(
-        !mesh.nodes[0]
-            .read(".vault/members")
-            .unwrap()
-            .contains(&rogue.id)
-    );
+        mesh.start_all();
+        let refused = format!("refusing history from {}", &mesh.nodes[1].id[..10]);
+        assert!(
+            wait_until(15, || mesh.nodes[0].log_text().contains(&refused)),
+            "{forgery}: {}",
+            mesh.logs()
+        );
+        assert_eq!(mesh.nodes[0].read("smuggled.md"), None, "{forgery}");
+        assert!(
+            !mesh.nodes[0]
+                .read(".vault/members")
+                .unwrap()
+                .contains(&rogue.id),
+            "{forgery}"
+        );
+    }
 }
 
 fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
@@ -558,6 +416,211 @@ fn heads_holding_the_same_edits_settle_without_merging_again() {
         heads.contains(&settled),
         "made a new merge {settled} instead of settling on one of {heads:?}"
     );
+}
+
+/// The merge vaultsync itself would make of `a` and `b`, built with plain git
+/// in `node`'s history.
+fn vaultsync_merge(node: &Node, a: &str, b: &str) -> String {
+    let gd = format!("--git-dir={}.git", node.folder.display());
+    let (mut ours, mut theirs) = (a.trim().to_owned(), b.trim().to_owned());
+    if theirs < ours {
+        std::mem::swap(&mut ours, &mut theirs);
+    }
+    let merged = git(
+        &node.folder,
+        &[
+            &gd,
+            "merge-tree",
+            "--write-tree",
+            "--allow-unrelated-histories",
+            &ours[..12],
+            &theirs[..12],
+        ],
+    );
+    unsigned_commit(
+        node,
+        merged.lines().next().unwrap(),
+        &[&ours, &theirs],
+        "Merge",
+        true,
+    )
+}
+
+/// A commit made with plain git: no vaultsync signature.
+fn unsigned_commit(
+    node: &Node,
+    tree: &str,
+    parents: &[&str],
+    message: &str,
+    as_merge: bool,
+) -> String {
+    let gd = format!("--git-dir={}.git", node.folder.display());
+    let time = if as_merge {
+        git(
+            &node.folder,
+            &[&[&gd, "log", "--no-walk", "--format=%ct"][..], parents].concat(),
+        )
+        .lines()
+        .map(|t| t.parse::<u64>().unwrap())
+        .max()
+        .unwrap()
+    } else {
+        1_700_000_000
+    };
+    let date = format!("{time} +0000");
+    let mut args = vec![
+        gd.as_str(),
+        "-c",
+        "commit.gpgsign=false",
+        "commit-tree",
+        tree.trim(),
+    ];
+    for p in parents {
+        args.extend(["-p", p]);
+    }
+    args.extend(["-m", message]);
+    let out = Command::new("git")
+        .args(&args)
+        .envs([
+            ("GIT_AUTHOR_NAME", "vault-sync"),
+            ("GIT_AUTHOR_EMAIL", "vault-sync"),
+            ("GIT_AUTHOR_DATE", date.as_str()),
+        ])
+        .envs([
+            ("GIT_COMMITTER_NAME", "vault-sync"),
+            ("GIT_COMMITTER_EMAIL", "vault-sync"),
+            ("GIT_COMMITTER_DATE", date.as_str()),
+        ])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+/// Points `node`'s history and folder at `commit`.
+fn move_head(node: &Node, commit: &str) {
+    let gd = format!("--git-dir={}.git", node.folder.display());
+    let wt = format!("--work-tree={}", node.folder.display());
+    git(&node.folder, &[&gd, "update-ref", "HEAD", commit]);
+    git(
+        &node.folder,
+        &[&gd, &wt, "read-tree", "-u", "--reset", "HEAD"],
+    );
+}
+
+/// A tree holding one file.
+fn tree_with_file(node: &Node, path: &str, text: &str) -> String {
+    let gdir = node.folder.with_extension("git");
+    let blob = git_in(&gdir, &["hash-object", "-w", "--stdin"], text);
+    let (dir, name) = path.rsplit_once('/').map_or(("", path), |(d, n)| (d, n));
+    let leaf = git_in(
+        &gdir,
+        &["mktree"],
+        &format!("100644 blob {}\t{name}\n", blob.trim()),
+    );
+    if dir.is_empty() {
+        leaf
+    } else {
+        git_in(
+            &gdir,
+            &["mktree"],
+            &format!("040000 tree {}\t{dir}\n", leaf.trim()),
+        )
+    }
+}
+
+#[test]
+fn history_slipped_in_under_an_exact_merge_is_refused() {
+    for forgery in ["fresh unsigned root", "merge inventing a member list"] {
+        let mut mesh = Mesh::new(2);
+        mesh.start_all();
+        mesh.converged(20);
+        mesh.stop_all();
+        let b = &mesh.nodes[1];
+        let gd = format!("--git-dir={}.git", b.folder.display());
+        let rogue = Node::new(mesh._tmp.path(), "rogue");
+        let slipped = if forgery == "fresh unsigned root" {
+            let tree = tree_with_file(b, "smuggled.md", "smuggled\n");
+            unsigned_commit(b, &tree, &[], "fresh start", false)
+        } else {
+            // Both parents are real, memberless roots both machines already have.
+            let roots = git(&b.folder, &[&gd, "rev-list", "--max-parents=0", "HEAD"]);
+            let roots: Vec<&str> = roots.lines().collect();
+            let tree = tree_with_file(b, ".vault/members", &format!("{} rogue\n", rogue.id));
+            unsigned_commit(b, &tree, &[roots[0], roots[1]], "Merge", true)
+        };
+        // Joined to the real history by exactly the merge vaultsync would make.
+        let head = git(&b.folder, &[&gd, "rev-parse", "HEAD"]);
+        let joined = vaultsync_merge(b, &head, &slipped);
+        move_head(b, &joined);
+
+        mesh.start_all();
+        let refused = format!("refusing history from {}", &mesh.nodes[1].id[..10]);
+        assert!(
+            wait_until(15, || mesh.nodes[0].log_text().contains(&refused)),
+            "{forgery}: {}",
+            mesh.logs()
+        );
+        assert_eq!(mesh.nodes[0].read("smuggled.md"), None, "{forgery}");
+        assert!(
+            !mesh.nodes[0]
+                .read(".vault/members")
+                .unwrap()
+                .contains(&rogue.id),
+            "{forgery}"
+        );
+    }
+}
+
+#[test]
+fn an_imported_vault_syncs_with_a_machine_added_by_hand() {
+    // m1's folder was a plain git repository: unsigned history, no member list.
+    let tmp = tempfile::tempdir().unwrap();
+    let addrs = tmp.path().join("addrs");
+    fs::create_dir(&addrs).unwrap();
+    let imported = tmp.path().join("m1");
+    fs::create_dir(&imported).unwrap();
+    git(&imported, &["init", "-q"]);
+    fs::write(imported.join("old.md"), "from before vaultsync\n").unwrap();
+    git(&imported, &["add", "old.md"]);
+    git(&imported, &["commit", "-qm", "years of notes"]);
+    let mut m0 = Node::new(tmp.path(), "m0");
+    let mut m1 = Node::new(tmp.path(), "m1");
+    m0.trust(&m1);
+    m1.trust(&m0);
+
+    m0.start_with(&addrs, None);
+    m1.start_with(&addrs, None);
+    assert!(
+        wait_until(20, || m0.read("old.md").is_some()),
+        "--- m0\n{}\n--- m1\n{}",
+        m0.log_text(),
+        m1.log_text()
+    );
+    assert!(
+        wait_until(20, || m0.head() == m1.head()),
+        "--- m0\n{}\n--- m1\n{}",
+        m0.log_text(),
+        m1.log_text()
+    );
+}
+
+/// Plain git with `input` on stdin.
+fn git_in(git_dir: &std::path::Path, args: &[&str], input: &str) -> String {
+    use std::io::Write;
+    let mut child = Command::new("git")
+        .arg(format!("--git-dir={}", git_dir.display()))
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap()
 }
 
 #[test]

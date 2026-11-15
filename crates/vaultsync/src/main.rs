@@ -1,5 +1,6 @@
 mod daemon;
 mod git;
+mod join;
 mod members;
 mod merge;
 mod net;
@@ -41,6 +42,28 @@ enum Cmd {
     /// Change the member list.
     #[command(subcommand)]
     Member(MemberCmd),
+    /// Print a one-time code (and link) another machine can join with.
+    Invite {
+        /// Seconds the code stays valid.
+        #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(1..))]
+        expires_in: u64,
+    },
+    /// Join a vault with a code from `vaultsync invite` on a member.
+    Join {
+        /// The code, or the whole link.
+        code: String,
+        /// Where to put the vault (default: the inviting machine's folder).
+        #[arg(long)]
+        folder: Option<PathBuf>,
+        /// Name recorded on this machine's commits (default: the hostname).
+        #[arg(long)]
+        machine: Option<String>,
+        #[arg(long, hide = true)]
+        addr_dir: Option<PathBuf>,
+    },
+    /// Remove a machine, by name or node id. Every member refuses it as the
+    /// removal reaches them.
+    Remove { device: String },
     /// List commits, newest first.
     Log {
         #[arg(short = 'n', default_value_t = 20)]
@@ -92,6 +115,24 @@ fn main() -> Result<()> {
             println!("committed {}", open()?.add_member(id, &name)?)
         }
         Cmd::Member(MemberCmd::List) => print!("{}", members::format(&open()?.members()?)),
+        Cmd::Invite { expires_in } => print!(
+            "{}",
+            join::invite(&open()?, Duration::from_secs(expires_in))?
+        ),
+        Cmd::Join {
+            code,
+            folder,
+            machine,
+            addr_dir,
+        } => {
+            let vault = join::join(&code, folder, machine, addr_dir)?;
+            print!("{}", vault.status()?);
+            println!(
+                "Joined. Start syncing with: vaultsync --vault {} run",
+                vault.folder().display()
+            );
+        }
+        Cmd::Remove { device } => println!("committed {}", open()?.remove_member(&device)?),
         Cmd::Log { limit, path } => print!("{}", open()?.log(limit, path.as_deref())?),
         Cmd::Rollback { commit, path } => {
             println!("committed {}", open()?.rollback(&commit, path.as_deref())?)

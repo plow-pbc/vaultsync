@@ -4,6 +4,7 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use iroh::{EndpointId, SecretKey};
@@ -140,7 +141,13 @@ impl Vault {
         self.git.value(["config", MACHINE_KEY])
     }
 
-    fn head(&self) -> Result<String> {
+    /// The full id of a commit.
+    pub fn resolve(&self, rev: &str) -> Result<String> {
+        self.git
+            .value(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])
+    }
+
+    pub fn head(&self) -> Result<String> {
         self.git.value(["rev-parse", "--verify", "-q", "HEAD"])
     }
 
@@ -167,24 +174,79 @@ impl Vault {
 
     /// The machines this one trusts: the member list at HEAD, plus itself.
     pub fn members(&self) -> Result<Members> {
-        let mut members = members::at(&self.git, "HEAD")?.unwrap_or_default();
-        members.insert(self.node_id()?, self.machine()?);
+        self.members_at("HEAD")
+    }
+
+    /// The machines trusted as of `rev`, plus this one.
+    pub fn members_at(&self, rev: &str) -> Result<Members> {
+        let mut members = members::at(&self.git, rev)?.unwrap_or_default();
+        members
+            .listed
+            .entry(self.node_id()?)
+            .or_insert(self.machine()?);
         Ok(members)
     }
 
     /// The other members, which this machine syncs with.
     pub fn peers(&self) -> Result<Vec<EndpointId>> {
         let me = self.node_id()?;
-        Ok(self.members()?.into_keys().filter(|id| *id != me).collect())
+        let members = self.members()?;
+        Ok(members
+            .active()
+            .map(|(id, _)| *id)
+            .filter(|id| *id != me)
+            .collect())
     }
 
     /// Adds a machine to the member list, in a commit signed by this one.
     pub fn add_member(&self, id: EndpointId, name: &str) -> Result<String> {
+        self.change_members(&format!("Add member {name}"), |members| {
+            if members.removed.contains_key(&id) {
+                bail!("{name} was removed; it can only come back by joining with a fresh invite");
+            }
+            members.listed.insert(id, name.to_owned());
+            Ok(())
+        })
+    }
+
+    /// Removes a machine, by node id or name. Every member refuses it once the
+    /// removal reaches them, and it can never be listed again.
+    pub fn remove_member(&self, device: &str) -> Result<String> {
+        let me = self.node_id()?;
+        let members = self.members()?;
+        let found: Vec<(EndpointId, String)> = members
+            .active()
+            .filter(|(id, name)| id.to_string() == device || name.as_str() == device)
+            .map(|(id, name)| (*id, name.clone()))
+            .collect();
+        let [(id, name)] = &found[..] else {
+            bail!("{device} names {} members; use its node id", found.len());
+        };
+        if *id == me {
+            bail!("this machine can't remove itself; remove it from another member");
+        }
+        self.change_members(&format!("Remove member {name}"), |members| {
+            members.listed.remove(id);
+            members.removed.insert(*id, name.clone());
+            Ok(())
+        })
+    }
+
+    /// Edits the member list and commits it, signed by this machine.
+    fn change_members(
+        &self,
+        subject: &str,
+        edit: impl FnOnce(&mut Members) -> Result<()>,
+    ) -> Result<String> {
         let _lock = self.lock()?;
         self.commit_pending_locked()?;
         let mut members = self.members()?;
-        members.insert(id, name.to_owned());
+        edit(&mut members)?;
         let path = self.folder().join(MEMBERS_PATH);
+        let text = members::format(&members);
+        if fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
+            return self.git.value(["rev-parse", "--short", "HEAD"]);
+        }
         let dir = path.parent().expect("has a parent");
         // Never write through a symlink a synced commit put there.
         for p in [dir, &path] {
@@ -196,9 +258,128 @@ impl Vault {
             }
         }
         fs::create_dir_all(dir)?;
-        fs::write(&path, members::format(&members))?;
+        fs::write(&path, text)?;
         self.git.run(["add", MEMBERS_PATH])?;
-        self.commit(&format!("Add member {name}"))
+        self.commit(subject)
+    }
+
+    /// Records a one-time invite valid for `ttl` and returns its secret. Only
+    /// a hash of the secret is kept here.
+    pub fn create_invite(&self, ttl: Duration) -> Result<[u8; 32]> {
+        let secret: [u8; 32] = rand::random();
+        let expires = SystemTime::now() + ttl;
+        let secs = expires.duration_since(UNIX_EPOCH)?.as_secs();
+        fs::write(self.invite_path(&secret)?, secs.to_string())?;
+        Ok(secret)
+    }
+
+    /// Uses up an invite: a second use, an unknown one or an expired one fails.
+    pub fn consume_invite(&self, secret: &[u8; 32]) -> Result<()> {
+        let path = self.invite_path(secret)?;
+        let expires = fs::read_to_string(&path).ok();
+        // Removing it is the atomic claim: of two joins racing, one wins.
+        if fs::remove_file(&path).is_err() {
+            bail!("this invite code is unknown or was already used");
+        }
+        let expires: u64 = expires.unwrap_or_default().trim().parse().unwrap_or(0);
+        if SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() > expires {
+            bail!("this invite code has expired");
+        }
+        Ok(())
+    }
+
+    fn invite_path(&self, secret: &[u8; 32]) -> Result<PathBuf> {
+        let dir = self.state("invites")?;
+        fs::create_dir_all(&dir)?;
+        Ok(dir.join(blake3::hash(secret).to_hex().as_str()))
+    }
+
+    /// An empty vault for a machine about to join: no commits yet. Refuses a
+    /// folder that already has files or history beside it.
+    pub fn for_join(folder: &Path, machine: Option<String>) -> Result<(Vault, bool)> {
+        // Resolve `.` and symlinks first, so the history beside the folder is
+        // checked where it really is.
+        let folder = std::path::absolute(folder)?;
+        let (Some(parent), Some(name)) = (folder.parent(), folder.file_name()) else {
+            bail!("{} can't hold a vault", folder.display());
+        };
+        fs::create_dir_all(parent)?;
+        let folder = folder
+            .canonicalize()
+            .or_else(|_| parent.canonicalize().map(|p| p.join(name)))?;
+        let has_files = match fs::read_dir(&folder) {
+            Ok(mut entries) => entries.next().is_some(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e).with_context(|| format!("can't read {}", folder.display())),
+        };
+        if has_files || git_dir_for(&folder).exists() {
+            bail!(
+                "{} already has files or history; join into an empty or new folder (--folder)",
+                folder.display()
+            );
+        }
+        let created = !folder.exists();
+        fs::create_dir_all(&folder)?;
+        let vault = Vault::at(folder);
+        vault.git.run(["init", "-q", "-b", "main"])?;
+        let machine = match machine {
+            Some(m) => m,
+            None => gethostname::gethostname().to_string_lossy().into_owned(),
+        };
+        vault.git.run(["config", MACHINE_KEY, &machine])?;
+        vault.ensure_union_merge()?;
+        Ok((vault, created))
+    }
+
+    /// Takes the inviter's full history from its bundle and fills the folder.
+    pub fn adopt(&self, bundle: &Path) -> Result<()> {
+        let mut cmd =
+            self.git
+                .command(["fetch", "-q", "--update-head-ok", "--no-write-fetch-head"]);
+        cmd.arg(bundle)
+            .arg(format!("+{}:refs/heads/main", self.bundle_ref(bundle)?));
+        exec(cmd)?;
+        fs::remove_file(bundle)?;
+        // Refuses to overwrite a file someone saved there during the join.
+        self.git
+            .run(["read-tree", "-m", "-u", "HEAD"])
+            .context("files appeared in the folder during the join")?;
+        Ok(())
+    }
+
+    /// Removes a vault [`for_join`](Self::for_join) made, after a failed join.
+    pub fn discard(self, created_folder: bool) -> Result<()> {
+        // Only what join wrote: files checked out and still as checked out,
+        // their emptied folders, the history beside, and the folder if join
+        // made it and nothing else landed there meanwhile.
+        let listed = self.git.run(["ls-files", "-z"]).unwrap_or_default();
+        let changed = self
+            .git
+            .run(["ls-files", "-z", "--modified"])
+            .unwrap_or_default();
+        let changed: Vec<&str> = changed.split('\0').collect();
+        for path in listed
+            .split('\0')
+            .filter(|p| !p.is_empty() && !changed.contains(p))
+        {
+            let file = self.folder().join(path);
+            if fs::remove_file(&file).is_ok() {
+                for dir in file.ancestors().skip(1).take_while(|d| *d != self.folder()) {
+                    if fs::remove_dir(dir).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(&self.git.git_dir)?;
+        if created_folder {
+            let _ = fs::remove_dir(self.folder());
+        }
+        Ok(())
+    }
+
+    pub fn machine_name(&self) -> Result<String> {
+        self.machine()
     }
 
     /// Serializes everything that writes to the index, the work tree or HEAD,
@@ -294,13 +475,22 @@ impl Vault {
             .value(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])?;
         let short = self.git.value(["rev-parse", "--short", &id])?;
         self.commit_pending_locked()?;
-        let (tree, what) = match path {
+        let (mut tree, what) = match path {
             None => (
                 self.git.value(["rev-parse", &format!("{id}^{{tree}}")])?,
                 "vault".to_owned(),
             ),
-            Some(path) => (self.tree_with(&id, path)?, path.display().to_string()),
+            Some(path) => (
+                self.tree_with("HEAD", &id, path)?,
+                path.display().to_string(),
+            ),
         };
+        // A rollback never undoes a membership change, whatever it selects:
+        // the member list stays as it is now.
+        let members = Path::new(MEMBERS_PATH);
+        if self.has(&tree, members) || self.has("HEAD", members) {
+            tree = self.tree_with(&tree, "HEAD", members)?;
+        }
         // Git overwrites ignored files freely; refuse instead.
         let added = self.git.run([
             "diff",
@@ -350,7 +540,13 @@ impl Vault {
 
     /// HEAD's tree with `path` as it was at `id` (absent if it was absent),
     /// built in a scratch index so the real one is untouched.
-    fn tree_with(&self, id: &str, path: &Path) -> Result<String> {
+    fn has(&self, rev: &str, path: &Path) -> bool {
+        self.git
+            .run(["cat-file", "-e", &format!("{rev}:{}", path.display())])
+            .is_ok()
+    }
+
+    fn tree_with(&self, base: &str, id: &str, path: &Path) -> Result<String> {
         let index = self.git.git_dir.join("vaultsync-rollback-index");
         let with_index = |args: &[&OsStr]| {
             let mut cmd = self.git.command(args);
@@ -358,7 +554,7 @@ impl Vault {
             exec(cmd)
         };
         let source = format!("--source={id}");
-        with_index(&["read-tree".as_ref(), "HEAD".as_ref()])?;
+        with_index(&["read-tree".as_ref(), base.as_ref()])?;
         with_index(&[
             "restore".as_ref(),
             "--staged".as_ref(),
@@ -397,19 +593,53 @@ impl Vault {
     }
 
     /// Whether HEAD has commits that `haves` lack.
-    pub fn has_news(&self, haves: &[String]) -> Result<bool> {
-        let mut args = vec!["rev-list", "-n1", "HEAD", "--not"];
+    pub fn has_news(&self, head: &str, haves: &[String]) -> Result<bool> {
+        let mut args = vec!["rev-list", "-n1", head, "--not"];
         args.extend(haves.iter().map(String::as_str));
         Ok(!self.git.run(args)?.is_empty())
     }
 
     /// `git bundle create - HEAD --not <haves>`, for streaming to a peer.
-    pub fn bundle_command(&self, haves: &[String]) -> std::process::Command {
-        let mut cmd = self
-            .git
-            .command(["bundle", "create", "-q", "-", "HEAD", "--not"]);
-        cmd.args(haves);
+    pub fn bundle_command(&self, pinned: &str, haves: &[String]) -> std::process::Command {
+        let mut cmd = self.git.command(["bundle", "create", "-q", "-", pinned]);
+        if !haves.is_empty() {
+            cmd.arg("--not").args(haves);
+        }
         cmd
+    }
+
+    /// Names `commit` with a ref of its own, so a bundle carries exactly that
+    /// commit however HEAD moves meanwhile. Drop it with [`unpin`](Self::unpin).
+    pub fn pin(&self, commit: &str) -> Result<String> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let name = format!("refs/vaultsync/serving/{}-{n}", std::process::id());
+        self.git.run(["update-ref", &name, commit])?;
+        Ok(name)
+    }
+
+    pub fn unpin(&self, name: &str) -> Result<()> {
+        self.git.run(["update-ref", "-d", name]).map(drop)
+    }
+
+    /// Drops pins a crashed or cancelled request left behind.
+    pub fn unpin_all(&self) -> Result<()> {
+        let pins = self.git.run([
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/vaultsync/serving",
+        ])?;
+        pins.lines().try_for_each(|name| self.unpin(name))
+    }
+
+    /// The one ref a peer's bundle carries.
+    fn bundle_ref(&self, bundle: &Path) -> Result<String> {
+        let mut cmd = self.git.command(["bundle", "list-heads"]);
+        cmd.arg(bundle);
+        let heads = exec(cmd)?;
+        let line = heads.lines().next().context("empty bundle")?;
+        let (_, name) = line.split_once(' ').context("malformed bundle")?;
+        Ok(name.to_owned())
     }
 
     /// Path for a bundle arriving from `peer`.
@@ -427,9 +657,11 @@ impl Vault {
     /// Stores a peer's head from its bundle.
     pub fn receive(&self, peer: &EndpointId, bundle: &Path) -> Result<()> {
         let name = peer_ref(peer);
-        let mut cmd = self.git.command(["fetch", "-q", "--no-write-fetch-head"]);
-        cmd.arg(bundle).arg(format!("+HEAD:{name}"));
-        let fetched = exec(cmd);
+        let fetched = self.bundle_ref(bundle).and_then(|r| {
+            let mut cmd = self.git.command(["fetch", "-q", "--no-write-fetch-head"]);
+            cmd.arg(bundle).arg(format!("+{r}:{name}"));
+            exec(cmd)
+        });
         fs::remove_file(bundle)?;
         fetched.map(drop)
     }
@@ -447,6 +679,14 @@ impl Vault {
         };
         for _ in 0..APPLY_TRIES {
             self.commit_pending_locked()?;
+            // History straight from a peer removed meanwhile counts for nothing;
+            // what a current member relays is judged commit by commit.
+            if !self.members()?.contains(peer) {
+                bail!(
+                    "refusing history from {}: no longer a member",
+                    peer.fmt_short()
+                );
+            }
             let head = self.head()?;
             if self.is_ancestor(&tip, &head) {
                 return Ok(None);
