@@ -296,7 +296,11 @@ impl Vault {
         let folder = folder
             .canonicalize()
             .or_else(|_| parent.canonicalize().map(|p| p.join(name)))?;
-        let has_files = fs::read_dir(&folder).is_ok_and(|mut entries| entries.next().is_some());
+        let has_files = match fs::read_dir(&folder) {
+            Ok(mut entries) => entries.next().is_some(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => return Err(e).with_context(|| format!("can't read {}", folder.display())),
+        };
         if has_files || git_dir_for(&folder).exists() {
             bail!(
                 "{} already has files or history; join into an empty or new folder (--folder)",
@@ -324,7 +328,10 @@ impl Vault {
         cmd.arg(bundle).arg("+HEAD:refs/heads/main");
         exec(cmd)?;
         fs::remove_file(bundle)?;
-        self.git.run(["read-tree", "-u", "--reset", "HEAD"])?;
+        // Refuses to overwrite a file someone saved there during the join.
+        self.git
+            .run(["read-tree", "-m", "-u", "HEAD"])
+            .context("files appeared in the folder during the join")?;
         Ok(())
     }
 
