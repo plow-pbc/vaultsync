@@ -39,7 +39,7 @@ enum Actions {
         }
     }
 
-    static func addFolder() {
+    static func addFolder(done: @escaping @MainActor () -> Void) {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -47,14 +47,10 @@ enum Actions {
         panel.prompt = "Sync this folder"
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            try CLI.run(["init", url.path])
-        } catch {
-            alert("Couldn't add \(url.lastPathComponent)", error.localizedDescription)
-        }
+        inBackground(["init", url.path], failure: "Couldn't add \(url.lastPathComponent)", then: done)
     }
 
-    static func join() {
+    static func join(done: @escaping @MainActor () -> Void) {
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 360, height: 24))
         field.placeholderString = "https://plow.co/sync#vs1… or the code"
         let prompt = NSAlert()
@@ -67,10 +63,20 @@ enum Actions {
         guard prompt.runModal() == .alertFirstButtonReturn else { return }
         let code = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !code.isEmpty else { return }
-        do {
-            try CLI.run(["join", code])
-        } catch {
-            alert("Couldn't join", error.localizedDescription)
+        inBackground(["join", code], failure: "Couldn't join", then: done)
+    }
+
+    /// Runs a slow CLI command (a join waits on the network) off the main
+    /// thread, so the menu keeps updating; the alert comes back on it.
+    private static func inBackground(_ args: [String], failure: String, then done: @escaping @MainActor () -> Void) {
+        Task.detached {
+            let result = Result { try CLI.run(args) }
+            await MainActor.run {
+                if case .failure(let error) = result {
+                    alert(failure, error.localizedDescription)
+                }
+                done()
+            }
         }
     }
 

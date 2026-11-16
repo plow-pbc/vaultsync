@@ -86,8 +86,8 @@ struct MenuContent: View {
             }
         }
         Divider()
-        Button("Add a folder…") { Actions.addFolder(); model.refresh() }
-        Button("Join with a code…") { Actions.join(); model.refresh() }
+        Button("Add a folder…") { Actions.addFolder { model.refresh() } }
+        Button("Join with a code…") { Actions.join { model.refresh() } }
         Divider()
         Button("Quit") { NSApplication.shared.terminate(nil) }.keyboardShortcut("q")
     }
