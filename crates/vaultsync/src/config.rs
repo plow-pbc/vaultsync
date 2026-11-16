@@ -47,8 +47,8 @@ pub fn track(folder: &Path) -> Result<()> {
 /// A vault may not be, or hold, this configuration: a vault's files come
 /// from other machines, and they must never land among these.
 pub fn refuse_overlap(folder: &Path) -> Result<()> {
-    let folder = std::path::absolute(folder)?;
-    let base = base()?;
+    let folder = resolve(folder)?;
+    let base = resolve(&base()?)?;
     if base.starts_with(&folder) || folder.starts_with(&base) {
         bail!(
             "{} overlaps vaultsync's own settings in {}; choose another folder",
@@ -57,4 +57,28 @@ pub fn refuse_overlap(folder: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `path` as the filesystem will see it, existing or not: `..` taken out,
+/// and the part that exists canonicalized, so a symlinked parent counts.
+fn resolve(path: &Path) -> Result<PathBuf> {
+    let mut lexical = PathBuf::new();
+    for part in std::path::absolute(path)?.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                lexical.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => lexical.push(other),
+        }
+    }
+    let mut existing = lexical.as_path();
+    let mut rest = vec![];
+    while !existing.exists() {
+        rest.push(existing.file_name().expect("not the root"));
+        existing = existing.parent().expect("the root exists");
+    }
+    let mut resolved = existing.canonicalize()?;
+    resolved.extend(rest.iter().rev());
+    Ok(resolved)
 }
