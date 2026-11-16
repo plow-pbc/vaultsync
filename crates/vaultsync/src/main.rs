@@ -71,11 +71,11 @@ enum Cmd {
         /// Only commits touching this path (relative to the vault).
         path: Option<PathBuf>,
     },
-    /// Restore the vault, or one path, to a prior commit as a new commit.
+    /// Restore the vault, or some of its paths, to a prior commit as a new commit.
     Rollback {
         commit: String,
-        /// Path relative to the vault.
-        path: Option<PathBuf>,
+        /// Paths relative to the vault, all in one commit; none for the whole vault.
+        paths: Vec<PathBuf>,
     },
     /// Commit edits as they happen and sync with the other members.
     Run {
@@ -138,8 +138,8 @@ fn main() -> Result<()> {
         }
         Cmd::Remove { device } => println!("committed {}", open()?.remove_member(&device)?),
         Cmd::Log { limit, path } => print!("{}", open()?.log(limit, path.as_deref())?),
-        Cmd::Rollback { commit, path } => {
-            println!("committed {}", open()?.rollback(&commit, path.as_deref())?)
+        Cmd::Rollback { commit, paths } => {
+            println!("committed {}", open()?.rollback(&commit, &paths)?)
         }
         Cmd::Run {
             catch_up,
