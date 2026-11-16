@@ -732,10 +732,10 @@ fn legacy_merge(node: &Node, a: &str, b: &str, signer: Option<&iroh::SecretKey>)
     unsigned_commit(node, tree, &[ours, theirs], &message, true)
 }
 
-/// Has `mesh.nodes[i]` commit a new note, with only its own daemon running.
-fn edit_alone(mesh: &mut Mesh, i: usize, path: &str) -> String {
+/// Has `mesh.nodes[i]` commit `text` at `path`, with only its own daemon running.
+fn edit_alone(mesh: &mut Mesh, i: usize, path: &str, text: &str) -> String {
     mesh.start(i);
-    mesh.nodes[i].write(path, "x\n");
+    mesh.nodes[i].write(path, text);
     mesh.nodes[i].committed();
     mesh.nodes[i].stop();
     mesh.nodes[i].head().trim().to_owned()
@@ -749,15 +749,15 @@ fn a_merge_from_the_first_release_counts_only_beneath_a_signed_commit() {
         mesh.converged(20);
         mesh.stop_all();
         let base = mesh.nodes[1].head().trim().to_owned();
-        let one = edit_alone(&mut mesh, 1, "one.md");
+        let one = edit_alone(&mut mesh, 1, "one.md", "x\n");
         move_head(&mesh.nodes[1], &base);
-        let two = edit_alone(&mut mesh, 1, "two.md");
+        let two = edit_alone(&mut mesh, 1, "two.md", "x\n");
         let rogue = iroh::SecretKey::generate();
         let signer = (case == "signs itself").then_some(&rogue);
         let legacy = legacy_merge(&mesh.nodes[1], &one, &two, signer);
         move_head(&mesh.nodes[1], &legacy);
         if case == "signed on top" {
-            edit_alone(&mut mesh, 1, "three.md");
+            edit_alone(&mut mesh, 1, "three.md", "x\n");
         }
 
         mesh.start_all();
@@ -776,4 +776,25 @@ fn a_merge_from_the_first_release_counts_only_beneath_a_signed_commit() {
             assert_eq!(mesh.nodes[0].read("one.md"), None, "{case}");
         }
     }
+}
+
+#[test]
+fn a_merge_is_judged_by_the_attributes_it_was_made_with() {
+    let mut mesh = Mesh::new(2);
+    mesh.nodes[0].write("notes.txt", "base\n");
+    mesh.start_all();
+    mesh.converged(20);
+    mesh.stop_all();
+    // m1 merges a same-line conflict as text, with markers.
+    let base = mesh.nodes[1].head().trim().to_owned();
+    let one = edit_alone(&mut mesh, 1, "notes.txt", "one\n");
+    move_head(&mesh.nodes[1], &base);
+    let two = edit_alone(&mut mesh, 1, "notes.txt", "two\n");
+    move_head(&mesh.nodes[1], &vaultsync_merge(&mesh.nodes[1], &one, &two));
+    // m0 meanwhile marks such files binary, which m1's merge never saw.
+    edit_alone(&mut mesh, 0, ".gitattributes", "*.txt binary\n");
+
+    mesh.start_all();
+    mesh.converged(AFTER_RESTART);
+    assert!(!mesh.logs().contains("refusing"), "{}", mesh.logs());
 }

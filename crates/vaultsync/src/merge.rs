@@ -7,8 +7,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use git2::{
-    AttrCheckFlags, AttrValue, IndexEntry, IndexTime, MergeFileInput, MergeFileOptions,
-    MergeOptions, Oid, Repository, Signature, Time,
+    AttrCheckFlags, AttrValue, Index, IndexEntry, IndexTime, MergeFileInput, MergeFileOptions,
+    MergeOptions, Oid, Repository, RepositoryOpenFlags, Signature, Time,
 };
 
 use crate::vault::is_binary;
@@ -22,7 +22,17 @@ pub const MERGE_TRAILER: &str = "Vault-Merge: 2";
 /// binary files keep both versions, the second beside the first.
 pub fn merge(repo: &Repository, a: Oid, b: Oid) -> Result<Oid> {
     let (ours, theirs) = if a < b { (a, b) } else { (b, a) };
+    // Attributes (a `binary` pattern, say) come from the commit merged into,
+    // not from this machine's files, so every machine merges alike.
+    let repo = Repository::open_ext(
+        repo.path(),
+        RepositoryOpenFlags::NO_SEARCH | RepositoryOpenFlags::BARE,
+        std::iter::empty::<&std::ffi::OsStr>(),
+    )?;
     let (ours, theirs) = (repo.find_commit(ours)?, repo.find_commit(theirs)?);
+    let mut attributes = Index::new()?;
+    attributes.read_tree(&ours.tree()?)?;
+    repo.set_index(&mut attributes)?;
     let mut merged = repo.merge_commits(&ours, &theirs, Some(&MergeOptions::new()))?;
     let labels = (
         ours.id().to_string()[..12].to_owned(),
@@ -37,7 +47,7 @@ pub fn merge(repo: &Repository, a: Oid, b: Oid) -> Result<Oid> {
         let lossy = |e: &IndexEntry| String::from_utf8_lossy(&e.path).into_owned();
         match (&c.our, &c.their) {
             (Some(o), Some(t)) if o.path == t.path => {
-                let (our_text, their_text) = (blob(repo, o.id)?, blob(repo, t.id)?);
+                let (our_text, their_text) = (blob(&repo, o.id)?, blob(&repo, t.id)?);
                 let path = String::from_utf8_lossy(&o.path).into_owned();
                 let no_merge = matches!(
                     AttrValue::from_string(repo.get_attr(
@@ -55,7 +65,7 @@ pub fn merge(repo: &Repository, a: Oid, b: Oid) -> Result<Oid> {
                     continue;
                 }
                 let base_text = match &c.ancestor {
-                    Some(a) => blob(repo, a.id)?,
+                    Some(a) => blob(&repo, a.id)?,
                     None => vec![],
                 };
                 let input = |text| {
@@ -103,7 +113,7 @@ pub fn merge(repo: &Repository, a: Oid, b: Oid) -> Result<Oid> {
     for entry in &resolved {
         merged.add(entry)?;
     }
-    let tree = repo.find_tree(merged.write_tree_to(repo)?)?;
+    let tree = repo.find_tree(merged.write_tree_to(&repo)?)?;
 
     let mut message = "Merge\n\n".to_owned();
     if !paths.is_empty() {
