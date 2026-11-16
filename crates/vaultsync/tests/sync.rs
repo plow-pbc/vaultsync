@@ -66,6 +66,7 @@ fn concurrent_offline_edits_merge_or_keep_both() {
     mesh.nodes[0].write("gone.md", "keep me\n");
     mesh.nodes[0].write("old-name.md", "a\nb\nc\nd\n");
     mesh.nodes[0].write(".gitattributes", "*.pdf binary\n");
+    std::os::unix::fs::symlink("notes.md", mesh.nodes[0].folder.join("link.md")).unwrap();
     mesh.start_all();
     mesh.converged(20);
     mesh.stop_all();
@@ -78,6 +79,10 @@ fn concurrent_offline_edits_merge_or_keep_both() {
     b.write("same.md", "uno\n");
     fs::remove_file(a.folder.join("gone.md")).unwrap();
     b.write("gone.md", "keep me, edited\n");
+    for (n, target) in [(a, "same.md"), (b, "old-name.md")] {
+        fs::remove_file(n.folder.join("link.md")).unwrap();
+        std::os::unix::fs::symlink(target, n.folder.join("link.md")).unwrap();
+    }
     fs::rename(a.folder.join("old-name.md"), a.folder.join("new-name.md")).unwrap();
     b.write("old-name.md", "a\nb\nc\nD\n");
     fs::write(a.folder.join("pic.png"), b"\x89PNG\0from a").unwrap();
@@ -144,6 +149,15 @@ fn concurrent_offline_edits_merge_or_keep_both() {
         .collect();
     docs.sort();
     assert_eq!(docs, ["%PDF from a\n", "%PDF from b\n"]);
+    // Retargeted links: both kept, each still a link.
+    let mut links: Vec<String> = fs::read_dir(&n.folder)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("link"))
+        .map(|p| fs::read_link(p).unwrap().display().to_string())
+        .collect();
+    links.sort();
+    assert_eq!(links, ["old-name.md", "same.md"]);
     let members = n.read(".vault/members").unwrap();
     assert!(
         members.contains(&extra_a.id)
@@ -732,6 +746,33 @@ fn legacy_merge(node: &Node, a: &str, b: &str, signer: Option<&iroh::SecretKey>)
     unsigned_commit(node, tree, &[ours, theirs], &message, true)
 }
 
+/// `tree` with `path` holding `text`, built in a scratch index.
+fn tree_plus(node: &Node, tree: &str, path: &str, text: &str) -> String {
+    let gdir = node.folder.with_extension("git");
+    let index = gdir.join("scratch-index");
+    let run = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg(format!("--git-dir={}", gdir.display()))
+            .args(args)
+            .env("GIT_INDEX_FILE", &index)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    run(&["read-tree", tree]);
+    let blob = git_in(&gdir, &["hash-object", "-w", "--stdin"], text);
+    run(&[
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &format!("100644,{},{path}", blob.trim()),
+    ]);
+    let tree = run(&["write-tree"]);
+    fs::remove_file(index).unwrap();
+    tree
+}
+
 /// Has `mesh.nodes[i]` commit `text` at `path`, with only its own daemon running.
 fn edit_alone(mesh: &mut Mesh, i: usize, path: &str, text: &str) -> String {
     mesh.start(i);
@@ -743,7 +784,12 @@ fn edit_alone(mesh: &mut Mesh, i: usize, path: &str, text: &str) -> String {
 
 #[test]
 fn a_merge_from_the_first_release_counts_only_beneath_a_signed_commit() {
-    for case in ["signed on top", "nothing on top", "signs itself"] {
+    for case in [
+        "signed on top",
+        "nothing on top",
+        "signs itself",
+        "lists its signer",
+    ] {
         let mut mesh = Mesh::new(2);
         mesh.start_all();
         mesh.converged(20);
@@ -754,10 +800,35 @@ fn a_merge_from_the_first_release_counts_only_beneath_a_signed_commit() {
         let two = edit_alone(&mut mesh, 1, "two.md", "x\n");
         let rogue = iroh::SecretKey::generate();
         let signer = (case == "signs itself").then_some(&rogue);
-        let legacy = legacy_merge(&mesh.nodes[1], &one, &two, signer);
+        let mut legacy = legacy_merge(&mesh.nodes[1], &one, &two, signer);
         move_head(&mesh.nodes[1], &legacy);
         if case == "signed on top" {
             edit_alone(&mut mesh, 1, "three.md", "x\n");
+        }
+        if case == "lists its signer" {
+            // The merge lists the rogue key, which then signs the commit on top.
+            let b = &mesh.nodes[1];
+            let members =
+                b.read(".vault/members").unwrap() + &format!("{} rogue\n", rogue.public());
+            let parents = git(
+                &b.folder,
+                &[
+                    "--git-dir",
+                    &format!("{}.git", b.folder.display()),
+                    "rev-list",
+                    "--parents",
+                    "-n1",
+                    &legacy,
+                ],
+            );
+            let parents: Vec<&str> = parents.split_whitespace().skip(1).collect();
+            let tree = tree_plus(b, &format!("{legacy}^{{tree}}"), ".vault/members", &members);
+            legacy = unsigned_commit(b, &tree, &parents, "Merge", true);
+            let message = format!(
+                "Update\n\n{}",
+                vaultsync_engine::members::sign(&rogue, &tree, &[&legacy])
+            );
+            move_head(b, &unsigned_commit(b, &tree, &[&legacy], &message, false));
         }
 
         mesh.start_all();

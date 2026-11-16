@@ -1,5 +1,6 @@
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,7 +11,6 @@ use git2::build::CheckoutBuilder;
 use git2::{
     ErrorCode, Index, IndexAddOption, ObjectType, Oid, Reference, Repository,
     RepositoryInitOptions, RepositoryOpenFlags, Signature, Status, StatusOptions, Tree,
-    TreeWalkMode, TreeWalkResult,
 };
 use iroh::{EndpointId, SecretKey};
 
@@ -645,7 +645,12 @@ impl Vault {
             out.push_str(&format!(
                 "{}  {}  {}  {}\n",
                 short(&repo, commit.id())?,
-                datetime(when.seconds() + i64::from(when.offset_minutes()) * 60),
+                chrono::DateTime::from_timestamp(
+                    when.seconds() + i64::from(when.offset_minutes()) * 60,
+                    0
+                )
+                .context("a commit time out of range")?
+                .format("%Y-%m-%d %H:%M:%S"),
                 String::from_utf8_lossy(commit.author().name_bytes()),
                 String::from_utf8_lossy(commit.summary_bytes().unwrap_or_default()),
             ));
@@ -935,51 +940,28 @@ fn tree_with(repo: &Repository, base: &Tree, source: &Tree, paths: &[PathBuf]) -
         let Ok(entry) = source.get_path(path) else {
             continue;
         };
-        let prefix = path.to_string_lossy().into_owned();
-        if entry.kind() != Some(ObjectType::Tree) {
-            index.add(&index_entry(
-                prefix.as_bytes(),
-                entry.filemode(),
-                entry.id(),
-            ))?;
-            continue;
-        }
-        let mut files = vec![];
-        repo.find_tree(entry.id())?
-            .walk(TreeWalkMode::PreOrder, |dir, e| {
-                if e.kind() != Some(ObjectType::Tree) {
-                    let name = format!("{prefix}/{dir}{}", String::from_utf8_lossy(e.name_bytes()));
-                    files.push((name, e.filemode(), e.id()));
-                }
-                TreeWalkResult::Ok
-            })?;
-        for (name, mode, id) in files {
-            index.add(&index_entry(name.as_bytes(), mode, id))?;
+        let prefix = path.as_os_str().as_bytes();
+        match entry.kind() {
+            Some(ObjectType::Tree) => {
+                add_files(repo, &mut index, prefix, &repo.find_tree(entry.id())?)?
+            }
+            _ => index.add(&index_entry(prefix, entry.filemode(), entry.id()))?,
         }
     }
     Ok(index.write_tree_to(repo)?)
 }
 
-/// `YYYY-MM-DD HH:MM:SS` for seconds since the epoch, already shifted to the
-/// wanted time zone.
-fn datetime(secs: i64) -> String {
-    let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    // Days to a civil date (Howard Hinnant's algorithm).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + i64::from(month <= 2);
-    format!(
-        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
-        rest / 3600,
-        rest % 3600 / 60,
-        rest % 60
-    )
+/// Adds every file under `tree` to `index`, each path under `prefix`, its
+/// name kept byte for byte.
+fn add_files(repo: &Repository, index: &mut Index, prefix: &[u8], tree: &Tree) -> Result<()> {
+    for e in tree.iter() {
+        let path = [prefix, b"/", e.name_bytes()].concat();
+        match e.kind() {
+            Some(ObjectType::Tree) => add_files(repo, index, &path, &repo.find_tree(e.id())?)?,
+            _ => index.add(&index_entry(&path, e.filemode(), e.id()))?,
+        }
+    }
+    Ok(())
 }
 
 /// Replaces `path` by renaming a finished copy over it: a crash leaves the
@@ -999,15 +981,5 @@ pub fn hooked(name: &str) -> bool {
 fn crash_if_hooked(name: &str) {
     if hooked(name) {
         std::process::exit(9);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn dates_are_civil() {
-        assert_eq!(super::datetime(0), "1970-01-01 00:00:00");
-        assert_eq!(super::datetime(951_782_400), "2000-02-29 00:00:00");
-        assert_eq!(super::datetime(1_763_300_000), "2025-11-16 13:33:20");
     }
 }

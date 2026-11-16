@@ -57,7 +57,13 @@ pub fn merge(repo: &Repository, a: Oid, b: Oid) -> Result<Oid> {
                     )?),
                     AttrValue::False
                 );
-                if no_merge || is_binary(&our_text) || is_binary(&their_text) {
+                let symlink = |mode: u32| mode & 0o170000 == 0o120000;
+                if no_merge
+                    || symlink(o.mode)
+                    || symlink(t.mode)
+                    || is_binary(&our_text)
+                    || is_binary(&their_text)
+                {
                     paths.insert(path.clone());
                     resolved.push(index_entry(&o.path, o.mode as i32, o.id));
                     let beside = side_name(&path, &t.id.to_string());
