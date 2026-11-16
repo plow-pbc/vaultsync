@@ -687,3 +687,42 @@ fn a_restarted_machine_s_edits_reach_its_peers_promptly() {
         mesh.logs()
     );
 }
+
+#[test]
+fn status_json_shows_each_peer_the_last_sync_and_conflicts() {
+    let mut mesh = Mesh::new(2);
+    mesh.start_all();
+    mesh.nodes[1].write("from-m1.md", "hello\n");
+    mesh.converged(20);
+    let status = |n: &Node| -> serde_json::Value {
+        serde_json::from_str(&ok(&n.folder, &["status", "--json"])).unwrap()
+    };
+    assert!(
+        wait_until(10, || status(&mesh.nodes[0])["last_sync"].is_u64()),
+        "{}",
+        status(&mesh.nodes[0])
+    );
+    let s = status(&mesh.nodes[0]);
+    assert_eq!(s["running"], true, "{s}");
+    assert_eq!(s["head"], mesh.nodes[0].head().trim());
+    let peers = s["peers"].as_array().unwrap();
+    assert_eq!(peers.len(), 1, "{s}");
+    assert_eq!(peers[0]["name"], "m1");
+    assert_eq!(peers[0]["id"], mesh.nodes[1].id);
+    assert_eq!(peers[0]["online"], true, "{s}");
+    assert_eq!(s["conflicts"], serde_json::json!([]));
+
+    // What a merge leaves for a person: markers in text, a copy beside a binary.
+    mesh.nodes[0].write(
+        "clash.md",
+        "<<<<<<< 0123456789ab\nmine\n=======\ntheirs\n>>>>>>> ba9876543210\n",
+    );
+    mesh.nodes[0].write("photo.conflict-1a2b3c4d.png", "png");
+    mesh.nodes[0].write("plain.md", "<<<<<<< not a merge\n");
+    mesh.nodes[0].write("accent.conflict-1234567é.md", "not a copy\n");
+    mesh.nodes[0].committed();
+    assert_eq!(
+        status(&mesh.nodes[0])["conflicts"],
+        serde_json::json!(["clash.md", "photo.conflict-1a2b3c4d.png"])
+    );
+}

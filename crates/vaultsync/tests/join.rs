@@ -335,7 +335,7 @@ fn a_failed_join_keeps_files_it_did_not_write() {
     mesh.nodes[0].start_with(&addrs, Some("stall-serving"));
     let code = mesh.nodes[0].invite(600);
     let folder = mesh._tmp.path().join("newcomer");
-    let mut join = std::process::Command::new(env!("CARGO_BIN_EXE_vaultsync"))
+    let mut join = common::bin()
         .args([
             "join",
             &code,

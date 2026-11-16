@@ -4,8 +4,19 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
+/// The binary under test, with its own config so `init` and `join` never
+/// add to the real list of vaults.
+pub fn bin() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_vaultsync"));
+    cmd.env(
+        "VAULTSYNC_CONFIG_DIR",
+        std::env::temp_dir().join("vaultsync-tests-config"),
+    );
+    cmd
+}
+
 pub fn vaultsync(vault: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_vaultsync"))
+    bin()
         .arg("--vault")
         .arg(vault)
         .args(args)
@@ -141,7 +152,7 @@ impl Node {
     }
 
     pub fn start_with(&mut self, addrs: &Path, hook: Option<&str>) {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_vaultsync"));
+        let mut cmd = bin();
         cmd.arg("--vault")
             .arg(&self.folder)
             .args(["run", "--catch-up", "1", "--addr-dir"])

@@ -8,6 +8,9 @@
 #       make PATH a vault (keeping any git history it has), as its first machine
 #   install.sh
 #       upgrade the binary and restart the service
+#
+# One service runs every vault this user has made or joined
+# (`vaultsync run --all`, listed in ~/.config/vaultsync/vaults).
 #   install.sh --uninstall
 #       stop and remove the service; the binary and the vault stay
 set -eu
@@ -84,44 +87,42 @@ mkdir -p "$BIN_DIR"
 install -m 755 "$tmp/vaultsync" "$BIN"
 say "Installed $("$BIN" --version) at $BIN"
 
-# The vault this machine syncs: joined, made, or (on upgrade) the one the
-# service already runs.
+# A service from before `run --all` names its one vault: list it first, so
+# it stays synced whatever this run adds.
+legacy=$(sed -n -e 's|.*<string>--vault</string><string>\(.*\)</string><string>run</string>.*|\1|p' \
+    -e 's|^ExecStart=".*" --vault "\(.*\)" run$|\1|p' "$PLIST" "$UNIT" 2>/dev/null | head -1)
+if [ -n "$legacy" ]; then "$BIN" --vault "$legacy" track; fi
+
+# Joining or making a vault adds it to the service's list.
 if [ -n "$code" ]; then
-    out=$("$BIN" join "$code" ${folder:+--folder "$folder"} ${machine:+--machine "$machine"})
     # Drop join's "start syncing with vaultsync run" hint: the service does that.
+    out=$("$BIN" join "$code" ${folder:+--folder "$folder"} ${machine:+--machine "$machine"})
     echo "$out" | sed 's/^Joined\. .*/Joined./'
-    folder=$(echo "$out" | sed -n 's/^vault: *//p')
 elif [ -n "$init" ]; then
-    out=$("$BIN" init "$init" ${machine:+--machine "$machine"})
-    echo "$out"
-    folder=$(echo "$out" | sed -n 's/^vault: *//p')
+    "$BIN" init "$init" ${machine:+--machine "$machine"}
 elif [ -f "$PLIST" ] || [ -f "$UNIT" ]; then
-    stop_service
+    : # an upgrade: the service below picks up the new binary
 else
     say "Binary installed. To sync a vault, run this again with a join code or --init PATH."
     exit 0
 fi
 
-# Paths go verbatim into a plist and a unit file, and the default folder
-# comes from the invite code: allow only characters both take as is.
-for path in "$folder" "$BIN"; do
-    case $path in
-        *[!A-Za-z0-9._/@+,:\ -]*) die "unsupported characters in path '$path'; choose a plain one with --folder" ;;
-    esac
-done
+# The binary's path goes verbatim into a plist and a unit file.
+case $BIN in
+    *[!A-Za-z0-9._/@+,:\ -]*) die "unsupported characters in '$BIN'; set VAULTSYNC_BIN_DIR to a plain path" ;;
+esac
 
 if [ $os = macos ]; then
-    if [ -n "$folder" ]; then
-        log=$HOME/Library/Logs/$NAME.log
-        mkdir -p "$(dirname "$PLIST")" "$(dirname "$log")"
-        cat > "$PLIST" <<EOF
+    log=$HOME/Library/Logs/$NAME.log
+    mkdir -p "$(dirname "$PLIST")" "$(dirname "$log")"
+    cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key><string>$NAME</string>
     <key>ProgramArguments</key>
-    <array><string>$BIN</string><string>--vault</string><string>$folder</string><string>run</string></array>
+    <array><string>$BIN</string><string>run</string><string>--all</string></array>
     <key>EnvironmentVariables</key>
     <dict><key>PATH</key><string>/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin</string></dict>
     <key>RunAtLoad</key><true/>
@@ -131,27 +132,24 @@ if [ $os = macos ]; then
 </dict>
 </plist>
 EOF
-    fi
     stop_service
     launchctl bootstrap "gui/$(id -u)" "$PLIST"
     say "Running as launchd agent '$NAME'; log: ~/Library/Logs/$NAME.log"
 else
-    if [ -n "$folder" ]; then
-        mkdir -p "$(dirname "$UNIT")"
-        cat > "$UNIT" <<EOF
+    mkdir -p "$(dirname "$UNIT")"
+    cat > "$UNIT" <<EOF
 [Unit]
-Description=vaultsync: keeps $folder in sync
+Description=vaultsync: keeps this user's vaults in sync
 After=network-online.target
 
 [Service]
-ExecStart="$BIN" --vault "$folder" run
+ExecStart="$BIN" run --all
 Restart=on-failure
 RestartSec=5
 
 [Install]
 WantedBy=default.target
 EOF
-    fi
     systemctl --user daemon-reload
     systemctl --user enable "$NAME" >/dev/null 2>&1
     systemctl --user restart "$NAME"

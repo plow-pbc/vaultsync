@@ -17,12 +17,16 @@ use tokio::task::spawn_blocking;
 use tokio::time::Instant;
 
 use crate::net::{Event, Net};
+use crate::status::{Seen, now};
 use crate::vault::Vault;
 
 const DEBOUNCE: Duration = Duration::from_millis(500);
 /// How often to look for changes when polling.
 const POLL: Duration = Duration::from_secs(2);
+/// How often `run --all` rereads the list of vaults.
+const CONFIG_POLL: Duration = Duration::from_secs(5);
 
+#[derive(Clone)]
 pub struct Opts {
     pub catch_up: Duration,
     pub addr_dir: Option<PathBuf>,
@@ -31,6 +35,41 @@ pub struct Opts {
 
 pub fn run(vault: Vault, opts: Opts) -> Result<()> {
     tokio::runtime::Runtime::new()?.block_on(daemon(vault, opts))
+}
+
+/// Runs every vault in the user's list side by side, starting ones added to
+/// it later and restarting any whose daemon stops.
+pub fn run_all(opts: Opts) -> Result<()> {
+    tokio::runtime::Runtime::new()?.block_on(async {
+        let mut running: std::collections::HashMap<PathBuf, tokio::task::JoinHandle<()>> =
+            Default::default();
+        loop {
+            running.retain(|_, task| !task.is_finished());
+            for folder in crate::config::vaults()? {
+                if running.contains_key(&folder) {
+                    continue;
+                }
+                let vault = match Vault::open(&folder) {
+                    Ok(vault) => vault,
+                    Err(e) => {
+                        eprintln!("{}: {e:#}", folder.display());
+                        continue;
+                    }
+                };
+                let opts = opts.clone();
+                let name = folder.display().to_string();
+                running.insert(
+                    folder,
+                    tokio::spawn(async move {
+                        if let Err(e) = daemon(vault, opts).await {
+                            eprintln!("{name}: {e:#}");
+                        }
+                    }),
+                );
+            }
+            tokio::time::sleep(CONFIG_POLL).await;
+        }
+    })
 }
 
 async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
@@ -62,6 +101,7 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
     let mut retry = Retry::default();
     let mut fetches = Fetches::default();
     let mut announced = None;
+    let mut seen = Seen::load(&vault)?.0;
     edited(&vault, &net, &mut retry, &mut announced).await;
     eprintln!(
         "watching {} as node {}",
@@ -80,6 +120,10 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
             },
             _ = tokio::time::sleep_until(deadline), if retry.at.is_some() => Event::Edited,
         };
+        if let Event::Poke(peer) | Event::Fetched(peer, Ok(())) = &event {
+            seen.peers.insert(peer.to_string(), now());
+        }
+        let record = !matches!(event, Event::Edited);
         match event {
             Event::Edited => edited(&vault, &net, &mut retry, &mut announced).await,
             Event::Poke(peer) => fetches.start(&vault, &net, &events, peer),
@@ -90,11 +134,18 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
             }
             Event::Fetched(peer, result) => {
                 match result {
-                    Ok(()) => integrate(&vault, &net, peer, &mut announced).await,
+                    Ok(()) => {
+                        if integrate(&vault, &net, peer, &mut announced).await {
+                            seen.last_sync = Some(now());
+                        }
+                    }
                     Err(e) => eprintln!("could not fetch from {}: {e:#}", peer.fmt_short()),
                 }
                 fetches.finish(&vault, &net, &events, peer);
             }
+        }
+        if record && let Err(e) = seen.save(&vault) {
+            eprintln!("could not record sync state: {e:#}");
         }
     }
     Ok(())
@@ -217,14 +268,24 @@ impl Fetches {
     }
 }
 
-async fn integrate(vault: &Vault, net: &Net, peer: EndpointId, announced: &mut Option<String>) {
+/// Takes in what `peer` sent; false when it was refused.
+async fn integrate(
+    vault: &Vault,
+    net: &Net,
+    peer: EndpointId,
+    announced: &mut Option<String>,
+) -> bool {
     match blocking(vault, move |v| v.integrate(&peer)).await {
         Ok(Some(head)) => {
             eprintln!("synced {} from {}", &head[..7], peer.fmt_short());
             announce(vault, net, announced).await;
+            true
         }
-        Ok(None) => {}
-        Err(e) => eprintln!("{e:#}"),
+        Ok(None) => true,
+        Err(e) => {
+            eprintln!("{e:#}");
+            false
+        }
     }
 }
 

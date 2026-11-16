@@ -60,8 +60,15 @@ impl Vault {
     /// inside the folder is moved beside it, and one already beside it is used
     /// as is. A folder with no history gets a first commit of its contents.
     pub fn init(folder: &Path, machine: Option<String>) -> Result<Vault> {
+        let created = !folder.exists();
         fs::create_dir_all(folder)?;
         let vault = Vault::at(folder.canonicalize()?);
+        if let Err(e) = crate::config::refuse_overlap(vault.folder()) {
+            if created {
+                fs::remove_dir(vault.folder())?;
+            }
+            return Err(e);
+        }
         let inner = vault.folder().join(".git");
         let beside = &vault.git.git_dir;
         // Check existing history before moving anything.
@@ -307,6 +314,7 @@ impl Vault {
         let folder = folder
             .canonicalize()
             .or_else(|_| parent.canonicalize().map(|p| p.join(name)))?;
+        crate::config::refuse_overlap(&folder)?;
         let has_files = match fs::read_dir(&folder) {
             Ok(mut entries) => entries.next().is_some(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -437,9 +445,58 @@ impl Vault {
         self.commit(&subject).map(Some)
     }
 
-    pub fn status(&self) -> Result<String> {
+    /// How many paths have changes not yet committed.
+    pub fn pending(&self) -> Result<usize> {
         let pending = self.git.run(["status", "--porcelain", "-z"])?;
-        let count = pending.split('\0').filter(|e| !e.is_empty()).count();
+        Ok(pending.split('\0').filter(|e| !e.is_empty()).count())
+    }
+
+    /// Files a merge left for a person: text with git's conflict markers, and
+    /// the `*.conflict-<id>.*` copies kept beside binary files.
+    pub fn conflicts(&self) -> Result<Vec<String>> {
+        let out = self
+            .git
+            .command(["grep", "-l", "-I", "-E", "^<{7} [0-9a-f]{12}"])
+            .output()?;
+        // 1 means no match.
+        if !out.status.success() && out.status.code() != Some(1) {
+            anyhow::bail!("git grep failed: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        // Pathspecs are literal here, so the copies are picked out by name.
+        let is_copy = |f: &str| {
+            f.rsplit('/')
+                .next()
+                .unwrap_or(f)
+                .split(".conflict-")
+                .nth(1)
+                .is_some_and(|rest| {
+                    rest.as_bytes()
+                        .get(..8)
+                        .is_some_and(|id| id.iter().all(u8::is_ascii_hexdigit))
+                })
+        };
+        let tracked = self.git.run(["ls-files", "-z"])?;
+        files.extend(
+            tracked
+                .split('\0')
+                .filter(|f| is_copy(f))
+                .map(str::to_owned),
+        );
+        files.sort();
+        Ok(files)
+    }
+
+    /// Where the running daemon keeps what it knows about its peers.
+    pub fn daemon_state(&self) -> Result<PathBuf> {
+        self.state("daemon.json")
+    }
+
+    pub fn status(&self) -> Result<String> {
+        let count = self.pending()?;
         Ok(format!(
             "vault:   {}\nhistory: {}\nmachine: {}\nnode:    {}\nbranch:  {}\nhead:    {}\n{count} uncommitted change{}\n",
             self.folder().display(),

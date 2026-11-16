@@ -1,10 +1,10 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 mod common;
-use common::{git, ok, vaultsync};
+use common::{bin, git, ok, vaultsync};
 use std::time::{Duration, Instant};
 
 const MACHINE: &str = "test-machine";
@@ -17,7 +17,7 @@ fn init(folder: &Path) -> String {
 }
 
 fn start_daemon(folder: &Path, extra: &[&str], hook: &str) -> std::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_vaultsync"))
+    bin()
         .env("VAULTSYNC_TEST_HOOK", hook)
         .arg("--vault")
         .arg(folder)
@@ -350,4 +350,91 @@ fn rollback_restores_prior_version_as_new_commit() {
             .contains(&format!("Roll back vault to {first}")),
         "{log}"
     );
+}
+
+#[test]
+fn one_service_runs_every_tracked_vault_including_ones_added_later() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config");
+    let run = |args: &[&str]| {
+        let out = bin()
+            .env("VAULTSYNC_CONFIG_DIR", &config)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let folder = |name: &str| {
+        tmp.path()
+            .join(name)
+            .canonicalize()
+            .unwrap_or(tmp.path().join(name))
+    };
+    run(&["init", folder("a").to_str().unwrap(), "--machine", MACHINE]);
+    run(&["init", folder("b").to_str().unwrap(), "--machine", MACHINE]);
+    run(&["--vault", folder("a").to_str().unwrap(), "track"]);
+    assert_eq!(fs::read_dir(config.join("vaults")).unwrap().count(), 2);
+    // A vault may be neither inside the settings nor around them.
+    // Spelled elsewhere, landing there: `..` after a symlinked folder.
+    fs::create_dir(tmp.path().join("sibling")).unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("sibling"), tmp.path().join("alias")).unwrap();
+    let around = tmp.path().join("alias/../config/notes");
+    for overlapping in [config.join("notes"), tmp.path().to_owned(), around] {
+        let out = bin()
+            .env("VAULTSYNC_CONFIG_DIR", &config)
+            .args(["init", overlapping.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{}", overlapping.display());
+    }
+    assert!(!config.join("notes").exists());
+
+    let mut service = bin()
+        .env("VAULTSYNC_CONFIG_DIR", &config)
+        .args(["run", "--all", "--catch-up", "1", "--addr-dir"])
+        .arg(tmp.path())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let committed = |name: &str, file: &str| {
+        common::wait_until(15, || {
+            run(&["--vault", folder(name).to_str().unwrap(), "log"])
+                .contains(&format!("Update {file}"))
+        })
+    };
+    fs::write(folder("a").join("note.md"), "in a\n").unwrap();
+    fs::write(folder("b").join("note.md"), "in b\n").unwrap();
+    assert!(committed("a", "note.md") && committed("b", "note.md"));
+
+    // A vault made while the service runs is picked up.
+    run(&["init", folder("c").to_str().unwrap(), "--machine", MACHINE]);
+    std::thread::sleep(Duration::from_secs(6));
+    fs::write(folder("c").join("note.md"), "in c\n").unwrap();
+    assert!(committed("c", "note.md"));
+
+    // A listed vault that has since gone reports an error; the rest still show.
+    run(&[
+        "init",
+        folder("gone").to_str().unwrap(),
+        "--machine",
+        MACHINE,
+    ]);
+    fs::remove_dir_all(folder("gone")).unwrap();
+    let all: serde_json::Value =
+        serde_json::from_str(&run(&["status", "--json", "--all"])).unwrap();
+    let all = all.as_array().unwrap();
+    assert_eq!(all.len(), 4);
+    for vault in &all[..3] {
+        assert_eq!(vault["running"], true, "{vault}");
+        assert_eq!(vault["pending"], 0, "{vault}");
+        assert_eq!(vault["machine"], MACHINE);
+    }
+    assert!(all[3]["error"].is_string(), "{}", all[3]);
+    service.kill().unwrap();
+    service.wait().unwrap();
 }
