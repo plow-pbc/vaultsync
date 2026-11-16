@@ -515,12 +515,18 @@ impl Vault {
     }
 
     /// `git add -A`: the index takes every change in the folder, ignored
-    /// files aside.
+    /// files aside. Written only when that changed it: a process stopped
+    /// mid-write leaves the index locked.
     fn stage_all(&self, repo: &Repository) -> Result<Index> {
         let mut index = repo.index()?;
+        let entries =
+            |index: &Index| -> Vec<_> { index.iter().map(|e| (e.path, e.id, e.mode)).collect() };
+        let before = entries(&index);
         index.add_all(["*"], IndexAddOption::DEFAULT, None)?;
         index.update_all(["*"], None)?;
-        index.write()?;
+        if entries(&index) != before {
+            index.write()?;
+        }
         Ok(index)
     }
 
