@@ -13,9 +13,16 @@ final class Engine {
     private var started = false
 
     /// Opens every folder the user granted before, then starts the engine.
+    /// Outside the sandbox (the direct download) the app shares the
+    /// command-line tool's settings, so where its service is installed that
+    /// service already runs every vault, and the app only shows them.
     func start() {
         guard !started else { return }
         started = true
+        if Self.serviceRunsVaults {
+            NSLog("BrainSync: the vaultsync service runs the vaults; showing them")
+            return
+        }
         for (path, data) in bookmarks {
             var stale = false
             guard let url = try? URL(resolvingBookmarkData: data, options: .withSecurityScope,
@@ -38,6 +45,13 @@ final class Engine {
                 Thread.sleep(forTimeInterval: 5)
             }
         }
+    }
+
+    private static var serviceRunsVaults: Bool {
+        let sandboxed = ProcessInfo.processInfo.environment["APP_SANDBOX_CONTAINER_ID"] != nil
+        let service = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/vaultsync.plist")
+        return !sandboxed && FileManager.default.fileExists(atPath: service.path)
     }
 
     /// Keeps access to a folder the user just picked, from now on.
