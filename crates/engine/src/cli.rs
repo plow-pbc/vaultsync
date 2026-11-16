@@ -136,7 +136,7 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<()> {
     let open = || Vault::open(&cli.vault);
     match cli.command {
         Cmd::Init { folder, machine } => {
-            let vault = Vault::init(&folder, machine)?;
+            let vault = Vault::init(&folder, machine.or_else(this_machine))?;
             config::track(vault.folder())?;
             write!(out, "{}", vault.status()?)?;
         }
@@ -178,7 +178,7 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<()> {
             machine,
             addr_dir,
         } => {
-            let vault = join::join(&code, folder, machine, addr_dir)?;
+            let vault = join::join(&code, folder, machine.or_else(this_machine), addr_dir)?;
             config::track(vault.folder())?;
             write!(out, "{}", vault.status()?)?;
             writeln!(
@@ -211,4 +211,13 @@ fn dispatch(cli: Cli, out: &mut dyn Write) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The name this machine already goes by in its other vaults, so one Mac
+/// isn't "air" in one vault and "mba" in the next.
+fn this_machine() -> Option<String> {
+    config::vaults()
+        .ok()?
+        .iter()
+        .find_map(|folder| Vault::open(folder).ok()?.machine_name().ok())
 }
