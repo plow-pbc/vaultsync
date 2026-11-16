@@ -28,8 +28,9 @@ for lib in objc resolv iconv c++ System; do
     printf -- "--- !tapi-tbd\ntbd-version: 4\ntargets: [ arm64-macos, x86_64-macos ]\ninstall-name: /usr/lib/lib$lib.dylib\n...\n" > /cache/stub/lib/lib$lib.tbd
 done
 for fw in Security SystemConfiguration CoreFoundation Foundation IOKit CoreServices AppKit Network; do
+    version=A; case $fw in Foundation|AppKit) version=C ;; esac
     mkdir -p /cache/stub/$fw.framework
-    printf -- "--- !tapi-tbd\ntbd-version: 4\ntargets: [ arm64-macos, x86_64-macos ]\ninstall-name: /System/Library/Frameworks/$fw.framework/Versions/A/$fw\n...\n" > /cache/stub/$fw.framework/$fw.tbd
+    printf -- "--- !tapi-tbd\ntbd-version: 4\ntargets: [ arm64-macos, x86_64-macos ]\ninstall-name: /System/Library/Frameworks/$fw.framework/Versions/$version/$fw\n...\n" > /cache/stub/$fw.framework/$fw.tbd
 done
 export MACOSX_DEPLOYMENT_TARGET=14.0
 export RUSTFLAGS="-C link-arg=-L/cache/stub/lib -C link-arg=-F/cache/stub -C link-arg=-undefined -C link-arg=dynamic_lookup"
