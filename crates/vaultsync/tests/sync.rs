@@ -719,6 +719,7 @@ fn status_json_shows_each_peer_the_last_sync_and_conflicts() {
     );
     mesh.nodes[0].write("photo.conflict-1a2b3c4d.png", "png");
     mesh.nodes[0].write("plain.md", "<<<<<<< not a merge\n");
+    mesh.nodes[0].write("accent.conflict-1234567é.md", "not a copy\n");
     mesh.nodes[0].committed();
     assert_eq!(
         status(&mesh.nodes[0])["conflicts"],

@@ -474,7 +474,9 @@ impl Vault {
                 .split(".conflict-")
                 .nth(1)
                 .is_some_and(|rest| {
-                    rest.len() >= 8 && rest[..8].bytes().all(|b| b.is_ascii_hexdigit())
+                    rest.as_bytes()
+                        .get(..8)
+                        .is_some_and(|id| id.iter().all(u8::is_ascii_hexdigit))
                 })
         };
         let tracked = self.git.run(["ls-files", "-z"])?;
