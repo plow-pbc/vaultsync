@@ -1,8 +1,11 @@
 import AppKit
 import SwiftUI
 
+import ServiceManagement
+
 @main
 struct VaultSyncBarApp: App {
+    @NSApplicationDelegateAdaptor private var delegate: AppDelegate
     @State private var model = Model()
 
     var body: some Scene {
@@ -12,6 +15,22 @@ struct VaultSyncBarApp: App {
             Image(systemName: model.symbol)
         }
         .menuBarExtraStyle(.menu)
+    }
+}
+
+/// Starts the engine with the app, opens at login unless the user turned
+/// that off, and stops the engine on quit.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        if !UserDefaults.standard.bool(forKey: "loginItemChosen") {
+            try? SMAppService.mainApp.register()
+            UserDefaults.standard.set(true, forKey: "loginItemChosen")
+        }
+        MainActor.assumeIsolated { Engine.shared.restart() }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        MainActor.assumeIsolated { Engine.shared.stop() }
     }
 }
 
@@ -89,6 +108,10 @@ struct MenuContent: View {
         Button("Add a folder…") { Actions.addFolder { model.refresh() } }
         Button("Join with a code…") { Actions.join { model.refresh() } }
         Divider()
+        Toggle("Open at Login", isOn: Binding(
+            get: { SMAppService.mainApp.status == .enabled },
+            set: { on in try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }
+        ))
         Button("Quit") { NSApplication.shared.terminate(nil) }.keyboardShortcut("q")
     }
 

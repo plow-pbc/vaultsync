@@ -22,19 +22,18 @@ struct VaultStatus: Decodable, Identifiable {
     var name: String { URL(fileURLWithPath: folder).lastPathComponent }
 }
 
-/// Runs the vaultsync CLI, which does all the work; this app only shows it.
+/// Runs the vaultsync engine embedded in this app, which does all the work;
+/// the app only shows it.
 enum CLI {
-    static let binary = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".local/bin/vaultsync").path
+    static let binary = Bundle.main.url(forAuxiliaryExecutable: "vaultsync")!
+    static let environment: [String: String] = ProcessInfo.processInfo.environment
 
     @discardableResult
     static func run(_ args: [String]) throws -> String {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: binary)
+        process.executableURL = binary
         process.arguments = args
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
-        process.environment = env
+        process.environment = environment
         let out = Pipe(), err = Pipe()
         process.standardOutput = out
         process.standardError = err
