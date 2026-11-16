@@ -100,12 +100,16 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
     let (events, mut rx) = mpsc::unbounded_channel();
 
     let edits = events.clone();
+    // The history changes with every commit; only the notes are edits.
+    let history = vault.history().to_owned();
     let _watch = watch(
         vault.folder(),
         opts.poll,
         move |res: DebounceEventResult| match res {
-            Ok(_) => {
-                let _ = edits.send(Event::Edited);
+            Ok(changes) => {
+                if changes.iter().any(|c| !c.path.starts_with(&history)) {
+                    let _ = edits.send(Event::Edited);
+                }
             }
             Err(e) => eprintln!("watch error: {e}"),
         },

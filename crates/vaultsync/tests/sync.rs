@@ -3,7 +3,7 @@ use std::process::Command;
 use std::time::Duration;
 
 mod common;
-use common::{AFTER_RESTART, Mesh, Node, git, ok, wait_until};
+use common::{AFTER_RESTART, Mesh, Node, git, history_dir, ok, wait_until};
 
 #[test]
 fn edits_reach_every_member_and_heads_settle() {
@@ -102,7 +102,7 @@ fn concurrent_offline_edits_merge_or_keep_both() {
     b.write("doc.pdf", "%PDF from b\n");
     // Vaults made before the members merge rule was written at init.
     for n in &mesh.nodes {
-        fs::remove_file(format!("{}.git/info/attributes", n.folder.display())).unwrap();
+        fs::remove_file(history_dir(&n.folder).join("info/attributes")).unwrap();
     }
 
     mesh.start_all();
@@ -288,7 +288,7 @@ fn history_vaultsync_did_not_write_is_refused() {
         members.push_str(&format!("{} rogue\n", rogue.id));
         b.write(".vault/members", &members);
         b.write("smuggled.md", "x\n");
-        let gd = format!("--git-dir={}.git", b.folder.display());
+        let gd = format!("--git-dir={}", history_dir(&b.folder).display());
         let wt = format!("--work-tree={}", b.folder.display());
         git(&b.folder, &[&gd, &wt, "add", "-A"]);
         if forgery == "unsigned commit" {
@@ -343,27 +343,17 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
     );
 }
 
-/// Copies a stopped machine's folder and history aside, or back.
+/// Copies a stopped machine's folder, history and all, aside, or back.
 fn snapshot(node: &Node, to: &std::path::Path) {
     fs::create_dir_all(to).unwrap();
-    for (from, name) in [
-        (node.folder.clone(), "vault"),
-        (node.folder.with_extension("git"), "vault.git"),
-    ] {
-        let dest = to.join(name);
-        let _ = fs::remove_dir_all(&dest);
-        copy_tree(&from, &dest);
-    }
+    let dest = to.join("vault");
+    let _ = fs::remove_dir_all(&dest);
+    copy_tree(&node.folder, &dest);
 }
 
 fn restore(node: &Node, from: &std::path::Path) {
-    for (to, name) in [
-        (node.folder.clone(), "vault"),
-        (node.folder.with_extension("git"), "vault.git"),
-    ] {
-        fs::remove_dir_all(&to).unwrap();
-        copy_tree(&from.join(name), &to);
-    }
+    fs::remove_dir_all(&node.folder).unwrap();
+    copy_tree(&from.join("vault"), &node.folder);
 }
 
 #[test]
@@ -434,7 +424,7 @@ fn heads_holding_the_same_edits_settle_without_merging_again() {
 
 /// The merge vaultsync itself would make of `a` and `b` in `node`'s history.
 fn vaultsync_merge(node: &Node, a: &str, b: &str) -> String {
-    let repo = git2::Repository::open_bare(node.folder.with_extension("git")).unwrap();
+    let repo = git2::Repository::open_bare(history_dir(&node.folder)).unwrap();
     let id = |c: &str| git2::Oid::from_str(c.trim()).unwrap();
     vaultsync_engine::merge::merge(&repo, id(a), id(b))
         .unwrap()
@@ -449,7 +439,7 @@ fn unsigned_commit(
     message: &str,
     as_merge: bool,
 ) -> String {
-    let gd = format!("--git-dir={}.git", node.folder.display());
+    let gd = format!("--git-dir={}", history_dir(&node.folder).display());
     let time = if as_merge {
         git(
             &node.folder,
@@ -493,7 +483,7 @@ fn unsigned_commit(
 
 /// Points `node`'s history and folder at `commit`.
 fn move_head(node: &Node, commit: &str) {
-    let gd = format!("--git-dir={}.git", node.folder.display());
+    let gd = format!("--git-dir={}", history_dir(&node.folder).display());
     let wt = format!("--work-tree={}", node.folder.display());
     git(&node.folder, &[&gd, "update-ref", "HEAD", commit]);
     git(
@@ -504,7 +494,7 @@ fn move_head(node: &Node, commit: &str) {
 
 /// A tree holding one file.
 fn tree_with_file(node: &Node, path: &str, text: &str) -> String {
-    let gdir = node.folder.with_extension("git");
+    let gdir = history_dir(&node.folder);
     let blob = git_in(&gdir, &["hash-object", "-w", "--stdin"], text);
     let (dir, name) = path.rsplit_once('/').map_or(("", path), |(d, n)| (d, n));
     let leaf = git_in(
@@ -531,7 +521,7 @@ fn history_slipped_in_under_an_exact_merge_is_refused() {
         mesh.converged(20);
         mesh.stop_all();
         let b = &mesh.nodes[1];
-        let gd = format!("--git-dir={}.git", b.folder.display());
+        let gd = format!("--git-dir={}", history_dir(&b.folder).display());
         let rogue = Node::new(mesh._tmp.path(), "rogue");
         let slipped = if forgery == "fresh unsigned root" {
             let tree = tree_with_file(b, "smuggled.md", "smuggled\n");
@@ -725,7 +715,7 @@ fn status_json_shows_each_peer_the_last_sync_and_conflicts() {
 /// A merge as the first release made them, with git's own merge: without the
 /// line that marks the current engine's merges, and signed by `signer` if any.
 fn legacy_merge(node: &Node, a: &str, b: &str, signer: Option<&iroh::SecretKey>) -> String {
-    let gd = format!("--git-dir={}.git", node.folder.display());
+    let gd = format!("--git-dir={}", history_dir(&node.folder).display());
     let (ours, theirs) = if a < b { (a, b) } else { (b, a) };
     let merged = git(
         &node.folder,
@@ -748,7 +738,7 @@ fn legacy_merge(node: &Node, a: &str, b: &str, signer: Option<&iroh::SecretKey>)
 
 /// `tree` with `path` holding `text`, built in a scratch index.
 fn tree_plus(node: &Node, tree: &str, path: &str, text: &str) -> String {
-    let gdir = node.folder.with_extension("git");
+    let gdir = history_dir(&node.folder);
     let index = gdir.join("scratch-index");
     let run = |args: &[&str]| {
         let out = Command::new("git")
@@ -814,7 +804,7 @@ fn a_merge_from_the_first_release_counts_only_beneath_a_signed_commit() {
                 &b.folder,
                 &[
                     "--git-dir",
-                    &format!("{}.git", b.folder.display()),
+                    &history_dir(&b.folder).display().to_string(),
                     "rev-list",
                     "--parents",
                     "-n1",
@@ -868,4 +858,48 @@ fn a_merge_is_judged_by_the_attributes_it_was_made_with() {
     mesh.start_all();
     mesh.converged(AFTER_RESTART);
     assert!(!mesh.logs().contains("refusing"), "{}", mesh.logs());
+}
+
+#[test]
+fn a_commit_that_would_write_into_the_history_is_refused() {
+    let mut mesh = Mesh::new(2);
+    mesh.start_all();
+    mesh.converged(20);
+    mesh.stop_all();
+    // m1, a member, signs a commit adding `.VaultSync/marker`: on macOS that
+    // lands in the history folder, whatever the case.
+    let b = &mesh.nodes[1];
+    let gdir = history_dir(&b.folder);
+    let gd = format!("--git-dir={}", gdir.display());
+    let head = b.head().trim().to_owned();
+    let blob = git_in(&gdir, &["hash-object", "-w", "--stdin"], "x\n");
+    let inner = git_in(
+        &gdir,
+        &["mktree"],
+        &format!("100644 blob {}\tmarker\n", blob.trim()),
+    );
+    let mut entries = git(&b.folder, &[&gd, "ls-tree", &head]);
+    entries.push_str(&format!("040000 tree {}\t.VaultSync\n", inner.trim()));
+    let tree = git_in(&gdir, &["mktree"], &entries).trim().to_owned();
+    let key: [u8; 32] = fs::read(gdir.join("vaultsync/key"))
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let key = iroh::SecretKey::from_bytes(&key);
+    let message = format!(
+        "Update\n\n{}",
+        vaultsync_engine::members::sign(&key, &tree, &[&head])
+    );
+    move_head(b, &unsigned_commit(b, &tree, &[&head], &message, false));
+
+    mesh.start_all();
+    let refused = "would write into the vault's .vaultsync folder";
+    assert!(
+        wait_until(15, || mesh.nodes[0].log_text().contains(refused)),
+        "{}",
+        mesh.logs()
+    );
+    let a = &mesh.nodes[0];
+    assert!(!a.folder.join(".VaultSync/marker").exists());
+    assert!(!history_dir(&a.folder).join("marker").exists());
 }
