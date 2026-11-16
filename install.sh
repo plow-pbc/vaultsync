@@ -104,8 +104,8 @@ if [ -n "$code" ]; then
 elif [ -n "$init" ]; then
     "$BIN" init "$init" ${machine:+--machine "$machine"}
 elif [ -f "$PLIST" ] || [ -f "$UNIT" ] \
-    || [ -n "$(ls -A "${VAULTSYNC_CONFIG_DIR:-$HOME/.config/vaultsync}/vaults" 2>/dev/null)" ]; then
-    : # an upgrade, or vaults joined without the service: it runs them below
+    || [ -n "$(ls -A "$HOME/.config/vaultsync/vaults" 2>/dev/null)" ]; then
+    : # an upgrade, or vaults joined without the service, which runs that list
 else
     say "Binary installed. To sync a vault, run this again with a join code or --init PATH."
     exit 0
