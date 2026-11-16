@@ -4,10 +4,9 @@
 pub mod cli;
 mod config;
 mod daemon;
-mod git;
 mod join;
-mod members;
-mod merge;
+pub mod members;
+pub mod merge;
 mod net;
 mod status;
 mod vault;

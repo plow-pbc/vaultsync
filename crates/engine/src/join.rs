@@ -95,7 +95,7 @@ pub fn join(
         let net = Net::bind(vault.secret_key()?, addr_dir.as_deref()).await?;
         net.join(&vault, invite.inviter, &invite.secret).await
     });
-    match result.and_then(|bundle| vault.adopt(&bundle)) {
+    match result.and_then(|pack| vault.adopt(&pack)) {
         Ok(()) => Ok(vault),
         Err(e) => {
             vault.discard(created)?;

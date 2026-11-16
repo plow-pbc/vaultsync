@@ -23,6 +23,8 @@ use crate::vault::Vault;
 const DEBOUNCE: Duration = Duration::from_millis(500);
 /// How often to look for changes when polling.
 const POLL: Duration = Duration::from_secs(2);
+/// How often a daemon waiting on another checks whether it stopped.
+const LOCK_POLL: Duration = Duration::from_secs(2);
 /// How often `run --all` rereads the list of vaults.
 const CONFIG_POLL: Duration = Duration::from_secs(5);
 
@@ -73,17 +75,41 @@ pub fn run_all(opts: Opts) -> Result<()> {
 }
 
 async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
-    vault.unpin_all()?;
+    // One daemon per vault, whichever edition runs it: a second one (the
+    // Mac app taking over from the command-line service, say) waits here
+    // until the first stops. The lock goes with the process.
+    let lock = std::fs::File::create(vault.run_lock()?)?;
+    let mut said = false;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if !said {
+                    eprintln!(
+                        "{}: another vaultsync is running this vault; waiting for it to stop",
+                        vault.folder().display()
+                    );
+                    said = true;
+                }
+                tokio::time::sleep(LOCK_POLL).await;
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    }
     let net = Net::bind(vault.secret_key()?, opts.addr_dir.as_deref()).await?;
     let (events, mut rx) = mpsc::unbounded_channel();
 
     let edits = events.clone();
+    // The history changes with every commit; only the notes are edits.
+    let history = vault.history().to_owned();
     let _watch = watch(
         vault.folder(),
         opts.poll,
         move |res: DebounceEventResult| match res {
-            Ok(_) => {
-                let _ = edits.send(Event::Edited);
+            Ok(changes) => {
+                if changes.iter().any(|c| !c.path.starts_with(&history)) {
+                    let _ = edits.send(Event::Edited);
+                }
             }
             Err(e) => eprintln!("watch error: {e}"),
         },
@@ -228,7 +254,7 @@ async fn edited(vault: &Vault, net: &Net, retry: &mut Retry, announced: &mut Opt
 /// Fetches run side by side, so a slow peer holds up neither edits nor other
 /// peers; each result comes back to the event loop, which integrates them one
 /// at a time. One fetch per peer: a request meanwhile runs after it. A running
-/// fetch is never cancelled, since its bundle import can't be.
+/// fetch is never cancelled, since its pack import can't be.
 #[derive(Default)]
 struct Fetches {
     running: HashSet<EndpointId>,

@@ -1,10 +1,10 @@
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Stdio;
 
 mod common;
-use common::{bin, git, ok, vaultsync};
+use common::{bin, git, history_dir, ok, vaultsync};
 use std::time::{Duration, Instant};
 
 const MACHINE: &str = "test-machine";
@@ -27,10 +27,6 @@ fn start_daemon(folder: &Path, extra: &[&str], hook: &str) -> std::process::Chil
         .stderr(Stdio::piped())
         .spawn()
         .unwrap()
-}
-
-fn git_dir(folder: &Path) -> PathBuf {
-    PathBuf::from(format!("{}.git", folder.display()))
 }
 
 /// Every ref with its commit id, plus HEAD.
@@ -56,13 +52,19 @@ fn existing_repo(dir: &Path) {
 }
 
 #[test]
-fn init_fresh_folder_keeps_history_beside_it() {
+fn init_fresh_folder_keeps_history_inside_it() {
     // A folder with no git, and one that was `git init`ed but never committed.
     for unborn in [false, true] {
         let tmp = tempfile::tempdir().unwrap();
         let folder = tmp.path().join("notes");
         fs::create_dir_all(folder.join("sub")).unwrap();
         fs::write(folder.join("a.md"), "hello\n").unwrap();
+        // An ignore rule that would bring the history, and its key, back in.
+        fs::write(
+            folder.join(".gitignore"),
+            "!*\n!.vaultsync/\n!.vaultsync/**\n",
+        )
+        .unwrap();
         if unborn {
             git(&folder, &["init", "-q"]);
         }
@@ -73,15 +75,16 @@ fn init_fresh_folder_keeps_history_beside_it() {
             !folder.join(".git").exists(),
             "vault folder must stay clean"
         );
-        assert!(git_dir(&folder).is_dir());
+        assert!(history_dir(&folder).is_dir());
         // Found from a subfolder, without --vault pointing at the root.
         let log = ok(&folder.join("sub"), &["log"]);
         assert!(
             log.contains(MACHINE) && log.contains("Initialize vault"),
             "{log}"
         );
-        let gd = format!("--git-dir={}", git_dir(&folder).display());
-        assert_eq!(git(tmp.path(), &[&gd, "ls-files"]), "a.md\n");
+        // The history is never one of the vault's files.
+        let gd = format!("--git-dir={}", history_dir(&folder).display());
+        assert_eq!(git(tmp.path(), &[&gd, "ls-files"]), ".gitignore\na.md\n");
 
         fs::write(folder.join("b.md"), "new\n").unwrap();
         let status = ok(&folder, &["status"]);
@@ -108,13 +111,18 @@ fn init_adopts_existing_history_unchanged() {
         let before = refs(&if layout == "inner" {
             folder.join(".git")
         } else {
-            git_dir(&folder)
+            tmp.path().join("notes.git")
         });
 
         init(&folder);
 
         assert!(!folder.join(".git").exists(), "{layout}");
-        assert_eq!(refs(&git_dir(&folder)), before, "{layout}: refs changed");
+        assert!(!tmp.path().join("notes.git").exists(), "{layout}");
+        assert_eq!(
+            refs(&history_dir(&folder)),
+            before,
+            "{layout}: refs changed"
+        );
         let log = ok(&folder, &["log"]);
         assert!(
             log.contains("second") && log.contains("first"),
@@ -135,7 +143,7 @@ fn init_refuses_unusable_history_and_moves_nothing() {
         let folder = tmp.path().join("notes");
         existing_repo(&folder);
         if case == "history in two places" {
-            fs::create_dir(git_dir(&folder)).unwrap();
+            fs::create_dir(tmp.path().join("notes.git")).unwrap();
         } else {
             git(&folder, &["checkout", "-q", "--detach"]);
         }
@@ -145,7 +153,7 @@ fn init_refuses_unusable_history_and_moves_nothing() {
         assert!(!out.status.success(), "{case}");
         assert!(folder.join(".git").is_dir(), "{case}: nothing may be moved");
         if case == "detached HEAD" {
-            assert!(!git_dir(&folder).exists(), "{case}");
+            assert!(!history_dir(&folder).exists(), "{case}");
         }
     }
 }
@@ -159,7 +167,7 @@ fn failed_auto_commit_is_retried_without_another_edit() {
     let mut stderr = BufReader::new(daemon.stderr.take().unwrap());
 
     // Another git process holds the index, so the commit fails.
-    let index_lock = git_dir(&folder).join("index.lock");
+    let index_lock = history_dir(&folder).join("index.lock");
     fs::write(&index_lock, "").unwrap();
     fs::write(folder.join("held.md"), "saved while git was busy\n").unwrap();
     let mut line = String::new();
@@ -179,6 +187,56 @@ fn failed_auto_commit_is_retried_without_another_edit() {
 }
 
 #[test]
+fn a_second_daemon_on_a_vault_waits_for_the_first_to_stop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("notes");
+    init(&folder);
+    let mut first = start_daemon(&folder, &[], "");
+    let mut first_err = BufReader::new(first.stderr.take().unwrap());
+    let mut line = String::new();
+    while !line.contains("watching") {
+        line.clear();
+        assert_ne!(
+            first_err.read_line(&mut line).unwrap(),
+            0,
+            "first daemon exited"
+        );
+    }
+    let mut second = start_daemon(&folder, &[], "");
+    let mut second_err = BufReader::new(second.stderr.take().unwrap());
+    line.clear();
+    second_err.read_line(&mut line).unwrap();
+    assert!(
+        line.contains("another vaultsync is running this vault"),
+        "{line}"
+    );
+
+    // Once the first stops, the second takes over.
+    first.kill().unwrap();
+    first.wait().unwrap();
+    line.clear();
+    while !line.contains("watching") {
+        line.clear();
+        assert_ne!(
+            second_err.read_line(&mut line).unwrap(),
+            0,
+            "second daemon exited"
+        );
+    }
+    fs::write(folder.join("after.md"), "saved under the second daemon\n").unwrap();
+    let start = Instant::now();
+    while !ok(&folder, &["log", "-n", "1"]).contains("Update after.md") {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "second daemon never committed"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    second.kill().unwrap();
+    second.wait().unwrap();
+}
+
+#[test]
 fn rollback_never_overwrites_a_file_it_does_not_track() {
     // (tracked once, ignored local file that now sits in its place)
     for (old, local) in [("draft.tmp", "draft.tmp"), ("drafts", "drafts/scratch.tmp")] {
@@ -194,7 +252,7 @@ fn rollback_never_overwrites_a_file_it_does_not_track() {
             .to_owned();
         // Later it is untracked, drafts are ignored, and someone keeps a local one.
         let (gd, wt) = (
-            format!("--git-dir={}", git_dir(&folder).display()),
+            format!("--git-dir={}", history_dir(&folder).display()),
             format!("--work-tree={}", folder.display()),
         );
         fs::write(folder.join(".gitignore"), "*.tmp\n").unwrap();
@@ -437,4 +495,54 @@ fn one_service_runs_every_tracked_vault_including_ones_added_later() {
     assert!(all[3]["error"].is_string(), "{}", all[3]);
     service.kill().unwrap();
     service.wait().unwrap();
+}
+
+#[test]
+fn a_vault_from_a_first_release_moves_its_history_inside_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("notes");
+    fs::create_dir(&folder).unwrap();
+    fs::write(folder.join("a.md"), "one\n").unwrap();
+    init(&folder);
+    fs::write(folder.join("a.md"), "one\ntwo\n").unwrap();
+    // The first releases kept the history beside the folder.
+    let beside = tmp.path().join("notes.git");
+    fs::rename(history_dir(&folder), &beside).unwrap();
+    let before = refs(&beside);
+
+    let status = ok(&folder, &["status"]);
+
+    assert!(!beside.exists());
+    assert_eq!(refs(&history_dir(&folder)), before, "refs changed");
+    assert!(status.contains("1 uncommitted change"), "{status}");
+    let log = ok(&folder, &["log"]);
+    assert!(log.contains("Initialize vault"), "{log}");
+}
+
+/// Linux only: macOS refuses file names that aren't UTF-8.
+#[cfg(target_os = "linux")]
+#[test]
+fn rollback_of_a_folder_keeps_names_that_are_not_utf8() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("notes");
+    let names = [b"\xfe.md".as_slice(), b"\xff.md".as_slice()];
+    let file = |name: &[u8]| folder.join("raw").join(std::ffi::OsStr::from_bytes(name));
+    fs::create_dir_all(folder.join("raw")).unwrap();
+    for name in names {
+        fs::write(file(name), "v1\n").unwrap();
+    }
+    init(&folder);
+    let first = ok(&folder, &["log"])
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    fs::remove_dir_all(folder.join("raw")).unwrap();
+
+    ok(&folder, &["rollback", &first, "raw"]);
+
+    for name in names {
+        assert_eq!(fs::read_to_string(file(name)).unwrap(), "v1\n");
+    }
 }

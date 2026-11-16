@@ -2,103 +2,171 @@
 //! the identical commit, so they converge instead of merging each other's
 //! merges forever.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
+use git2::{
+    AttrCheckFlags, AttrValue, Index, IndexEntry, IndexTime, MergeFileInput, MergeFileOptions,
+    MergeOptions, Oid, Repository, RepositoryOpenFlags, Signature, Time,
+};
 
-use crate::git::{Git, exec};
+use crate::vault::is_binary;
+
+/// The line that marks a merge made by this engine, which every member can
+/// recompute exactly. Merges without it came from the earlier engine.
+pub const MERGE_TRAILER: &str = "Vault-Merge: 2";
 
 /// Merges commits `a` and `b` and returns the merge commit. Same-line edits
-/// keep git's conflict markers; conflicting binary files keep both versions.
-pub fn merge(git: &Git, a: &str, b: &str) -> Result<String> {
+/// keep conflict markers labelled with both sides' short ids; conflicting
+/// binary files keep both versions, the second beside the first.
+pub fn merge(repo: &Repository, a: Oid, b: Oid) -> Result<Oid> {
     let (ours, theirs) = if a < b { (a, b) } else { (b, a) };
-    // Short ids label the conflict markers, the same on every machine.
-    let out = git
-        .command([
-            "merge-tree",
-            "--write-tree",
-            "--allow-unrelated-histories",
-            "-z",
-            &ours[..12],
-            &theirs[..12],
-        ])
-        .output()?;
-    if !matches!(out.status.code(), Some(0 | 1)) {
-        bail!(
-            "merge-tree failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut fields = stdout.split('\0');
-    let mut tree = fields
-        .next()
-        .context("merge-tree printed nothing")?
-        .to_owned();
+    // Attributes (a `binary` pattern, say) come from the commit merged into,
+    // not from this machine's files, so every machine merges alike.
+    let repo = Repository::open_ext(
+        repo.path(),
+        RepositoryOpenFlags::NO_SEARCH | RepositoryOpenFlags::BARE,
+        std::iter::empty::<&std::ffi::OsStr>(),
+    )?;
+    let (ours, theirs) = (repo.find_commit(ours)?, repo.find_commit(theirs)?);
+    let mut attributes = Index::new()?;
+    attributes.read_tree(&ours.tree()?)?;
+    repo.set_index(&mut attributes)?;
+    let mut merged = repo.merge_commits(&ours, &theirs, Some(&MergeOptions::new()))?;
+    let labels = (
+        ours.id().to_string()[..12].to_owned(),
+        theirs.id().to_string()[..12].to_owned(),
+    );
 
-    // Conflicted paths: "<mode> <oid> <stage>\t<path>", until an empty field.
-    let mut conflicts: BTreeMap<&str, BTreeMap<&str, (&str, &str)>> = BTreeMap::new();
-    for entry in fields.take_while(|f| !f.is_empty()) {
-        let (meta, path) = entry.split_once('\t').context("bad merge-tree entry")?;
-        let [mode, oid, stage] = meta.split(' ').collect::<Vec<_>>()[..] else {
-            bail!("bad merge-tree entry: {entry}");
-        };
-        conflicts
-            .entry(path)
-            .or_default()
-            .insert(stage, (mode, oid));
-    }
-    // Both sides changed it, yet git left one side's version as is (binary
-    // content, or a `binary`/`-merge` attribute): keep the other beside it.
-    let mut unmarked: Vec<(String, &str, &str)> = Vec::new();
-    for (path, stages) in &conflicts {
-        let (Some(&(m2, o2)), Some(&(m3, o3))) = (stages.get("2"), stages.get("3")) else {
-            continue;
-        };
-        let kept = git
-            .value(["rev-parse", &format!("{tree}:{path}")])
-            .unwrap_or_default();
-        if kept == o2 {
-            unmarked.push((side_name(path, o3), m3, o3));
-        } else if kept == o3 {
-            unmarked.push((side_name(path, o2), m2, o2));
+    let conflicts: Vec<_> = merged.conflicts()?.collect::<Result<_, _>>()?;
+    // What a person should look at, for the commit message.
+    let mut paths = BTreeSet::new();
+    let mut resolved = vec![];
+    for c in &conflicts {
+        let lossy = |e: &IndexEntry| String::from_utf8_lossy(&e.path).into_owned();
+        match (&c.our, &c.their) {
+            (Some(o), Some(t)) if o.path == t.path => {
+                let (our_text, their_text) = (blob(&repo, o.id)?, blob(&repo, t.id)?);
+                let path = String::from_utf8_lossy(&o.path).into_owned();
+                let no_merge = matches!(
+                    AttrValue::from_string(repo.get_attr(
+                        Path::new(&path),
+                        "merge",
+                        AttrCheckFlags::default()
+                    )?),
+                    AttrValue::False
+                );
+                let symlink = |mode: u32| mode & 0o170000 == 0o120000;
+                if no_merge
+                    || symlink(o.mode)
+                    || symlink(t.mode)
+                    || is_binary(&our_text)
+                    || is_binary(&their_text)
+                {
+                    paths.insert(path.clone());
+                    resolved.push(index_entry(&o.path, o.mode as i32, o.id));
+                    let beside = side_name(&path, &t.id.to_string());
+                    resolved.push(index_entry(beside.as_bytes(), t.mode as i32, t.id));
+                    continue;
+                }
+                let base_text = match &c.ancestor {
+                    Some(a) => blob(&repo, a.id)?,
+                    None => vec![],
+                };
+                let input = |text| {
+                    let mut input = MergeFileInput::new();
+                    input.content(text);
+                    input
+                };
+                let mut opts = MergeFileOptions::new();
+                opts.our_label(&labels.0).their_label(&labels.1);
+                let result = git2::merge_file(
+                    &input(&base_text),
+                    &input(&our_text),
+                    &input(&their_text),
+                    Some(&mut opts),
+                )?;
+                if !result.is_automergeable() {
+                    paths.insert(path);
+                }
+                let id = repo.blob(result.content())?;
+                resolved.push(index_entry(&o.path, o.mode as i32, id));
+            }
+            // One side deleted or renamed it: what the other side left as
+            // it was goes with it, and what it changed is kept, each version
+            // at its own path.
+            (our, their) => {
+                let unchanged = |e: &IndexEntry| {
+                    c.ancestor
+                        .as_ref()
+                        .is_some_and(|a| (&a.path, a.id, a.mode) == (&e.path, e.id, e.mode))
+                };
+                for e in [our, their].into_iter().flatten() {
+                    if !unchanged(e) {
+                        paths.insert(lossy(e));
+                        resolved.push(index_entry(&e.path, e.mode as i32, e.id));
+                    }
+                }
+            }
         }
     }
-    if !unmarked.is_empty() {
-        tree = add_to_tree(git, &tree, &unmarked)?;
+    for c in &conflicts {
+        for e in [&c.ancestor, &c.our, &c.their].into_iter().flatten() {
+            merged.remove_path(Path::new(&*String::from_utf8_lossy(&e.path)))?;
+        }
     }
+    for entry in &resolved {
+        merged.add(entry)?;
+    }
+    let tree = repo.find_tree(merged.write_tree_to(&repo)?)?;
 
-    let mut message = "Merge".to_owned();
-    if !conflicts.is_empty() {
-        message.push_str("\n\nConflicts:\n");
-        for path in conflicts.keys() {
+    let mut message = "Merge\n\n".to_owned();
+    if !paths.is_empty() {
+        message.push_str("Conflicts:\n");
+        for path in &paths {
             message.push_str(&format!("\t{path}\n"));
         }
+        message.push('\n');
     }
-    let time = git
-        .value(["log", "--no-walk", "--format=%ct", ours, theirs])?
-        .lines()
-        .filter_map(|t| t.parse::<u64>().ok())
-        .max()
-        .context("parents without commit times")?;
-    let date = format!("{time} +0000");
-    let mut cmd = git.command([
-        "commit-tree",
-        &tree,
-        "-p",
-        ours,
-        "-p",
-        theirs,
-        "-m",
-        &message,
-    ]);
-    for who in ["AUTHOR", "COMMITTER"] {
-        cmd.env(format!("GIT_{who}_NAME"), "vault-sync")
-            .env(format!("GIT_{who}_EMAIL"), "vault-sync")
-            .env(format!("GIT_{who}_DATE"), &date);
+    message.push_str(MERGE_TRAILER);
+    message.push('\n');
+    let time = ours.time().seconds().max(theirs.time().seconds());
+    let who = Signature::new("vaultsync", "vaultsync", &Time::new(time, 0))?;
+    Ok(repo.commit(None, &who, &who, &message, &tree, &[&ours, &theirs])?)
+}
+
+/// Whether `message` is that of a merge this engine made.
+pub fn is_current(message: &[u8]) -> bool {
+    message
+        .split(|b| *b == b'\n')
+        .any(|line| line == MERGE_TRAILER.as_bytes())
+}
+
+fn blob(repo: &Repository, id: Oid) -> Result<Vec<u8>> {
+    Ok(repo
+        .find_blob(id)
+        .context("reading a merged file")?
+        .content()
+        .to_vec())
+}
+
+/// An index entry for a file already stored in the repository.
+pub fn index_entry(path: &[u8], mode: i32, id: Oid) -> IndexEntry {
+    IndexEntry {
+        ctime: IndexTime::new(0, 0),
+        mtime: IndexTime::new(0, 0),
+        dev: 0,
+        ino: 0,
+        mode: mode as u32,
+        uid: 0,
+        gid: 0,
+        file_size: 0,
+        id,
+        flags: path.len().min(0xfff) as u16,
+        flags_extended: 0,
+        path: path.to_vec(),
     }
-    Ok(exec(cmd)?.trim_end().to_owned())
 }
 
 /// `photo.png` → `photo.conflict-1a2b3c4d.png`, beside the original.
@@ -113,27 +181,4 @@ fn side_name(path: &str, oid: &str) -> String {
         Some(dir) => dir.join(name).to_string_lossy().into_owned(),
         None => name,
     }
-}
-
-/// `tree` plus extra files, built in a scratch index so the real one is untouched.
-fn add_to_tree(git: &Git, tree: &str, files: &[(String, &str, &str)]) -> Result<String> {
-    let index = git.git_dir.join("vaultsync").join("merge-index");
-    let _ = std::fs::remove_file(&index);
-    let with_index = |args: &[&str]| {
-        let mut cmd = git.command(args);
-        cmd.env("GIT_INDEX_FILE", &index);
-        exec(cmd)
-    };
-    with_index(&["read-tree", tree])?;
-    for (path, mode, oid) in files {
-        with_index(&[
-            "update-index",
-            "--add",
-            "--cacheinfo",
-            &format!("{mode},{oid},{path}"),
-        ])?;
-    }
-    let tree = with_index(&["write-tree"])?;
-    std::fs::remove_file(&index)?;
-    Ok(tree.trim_end().to_owned())
 }

@@ -5,7 +5,8 @@
 //! ed25519 signature by the machine's node key over the commit's tree and
 //! parents. Once a vault has a member list, a commit arriving from a peer is
 //! accepted only if a member at its parent signed it, or it is exactly the
-//! deterministic merge of its parents. A removed machine stays removed: its tombstone
+//! deterministic merge of its parents. A merge the earlier engine made can't
+//! be recomputed; it counts only beneath a member's signed commit. A removed machine stays removed: its tombstone
 //! (`removed <id> <name>`) outranks any line listing it, and never goes away.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -13,8 +14,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use anyhow::{Context, Result, bail};
 use iroh::{EndpointId, SecretKey, Signature};
 
-use crate::git::Git;
-use crate::merge::merge;
+use git2::{Oid, Repository};
+
+use crate::merge::{is_current, merge};
 
 pub const MEMBERS_PATH: &str = ".vault/members";
 const TRAILER: &str = "Vault-Signature:";
@@ -69,11 +71,17 @@ pub fn format(members: &Members) -> String {
 }
 
 /// The member list in `rev`'s tree, if it has one.
-pub fn at(git: &Git, rev: &str) -> Result<Option<Members>> {
-    match git.run(["cat-file", "blob", &format!("{rev}:{MEMBERS_PATH}")]) {
-        Ok(text) => parse(&text).map(Some),
-        Err(_) => Ok(None),
-    }
+pub fn at(repo: &Repository, rev: &str) -> Result<Option<Members>> {
+    let Ok(commit) = repo.revparse_single(rev).and_then(|o| o.peel_to_commit()) else {
+        return Ok(None);
+    };
+    let Ok(entry) = commit.tree()?.get_path(std::path::Path::new(MEMBERS_PATH)) else {
+        return Ok(None);
+    };
+    let Ok(blob) = repo.find_blob(entry.id()) else {
+        return Ok(None);
+    };
+    parse(&String::from_utf8_lossy(blob.content())).map(Some)
 }
 
 fn payload(tree: &str, parents: &[&str]) -> Vec<u8> {
@@ -91,16 +99,12 @@ pub fn sign(key: &SecretKey, tree: &str, parents: &[&str]) -> String {
 }
 
 /// The node that validly signed `commit`, if any.
-fn signer(git: &Git, commit: &str) -> Result<Option<EndpointId>> {
-    let raw = git.run(["cat-file", "commit", commit])?;
-    let (header, message) = raw.split_once("\n\n").unwrap_or((&raw, ""));
-    let field = |name: &'static str| {
-        header
-            .lines()
-            .filter_map(move |l| l.strip_prefix(name)?.strip_prefix(' '))
-    };
-    let tree = field("tree").next().context("commit without tree")?;
-    let parents: Vec<&str> = field("parent").collect();
+fn signer(repo: &Repository, commit: Oid) -> Result<Option<EndpointId>> {
+    let commit = repo.find_commit(commit)?;
+    let tree = commit.tree_id().to_string();
+    let parents: Vec<String> = commit.parent_ids().map(|p| p.to_string()).collect();
+    let parents: Vec<&str> = parents.iter().map(String::as_str).collect();
+    let message = String::from_utf8_lossy(commit.message_bytes());
     let Some(value) = message.lines().rev().find_map(|l| l.strip_prefix(TRAILER)) else {
         return Ok(None);
     };
@@ -119,73 +123,117 @@ fn signer(git: &Git, commit: &str) -> Result<Option<EndpointId>> {
         return Ok(None);
     };
     Ok(id
-        .verify(&payload(tree, &parents), &Signature::from_bytes(&sig))
+        .verify(&payload(&tree, &parents), &Signature::from_bytes(&sig))
         .is_ok()
         .then_some(id))
+}
+
+/// Commits reachable from any of `from` but not from `head`.
+fn reachable(repo: &Repository, from: &[Oid], head: Oid) -> Result<HashSet<Oid>> {
+    if from.is_empty() {
+        return Ok(HashSet::new());
+    }
+    let mut walk = repo.revwalk()?;
+    for id in from {
+        walk.push(*id)?;
+    }
+    walk.hide(head)?;
+    Ok(walk.collect::<Result<_, _>>()?)
 }
 
 /// Checks every commit reachable from `tip` but not from `head`. `trusted` is
 /// the local member list, which vouches for a list appearing where a parent
 /// had none.
-pub fn validate(git: &Git, head: &str, tip: &str, trusted: &Members) -> Result<()> {
-    let graph = git.run(["rev-list", "--parents", tip, "--not", head])?;
-    let mut lists: HashMap<String, Option<Members>> = HashMap::new();
-    let mut at_cached = |rev: &str| -> Result<Option<Members>> {
-        if !lists.contains_key(rev) {
-            lists.insert(rev.to_owned(), at(git, rev)?);
+pub fn validate(repo: &Repository, head: Oid, tip: Oid, trusted: &Members) -> Result<()> {
+    let mut walk = repo.revwalk()?;
+    walk.push(tip)?;
+    walk.hide(head)?;
+    let mut commits: Vec<(Oid, Vec<Oid>)> = vec![];
+    for id in walk {
+        let id = id?;
+        commits.push((id, repo.find_commit(id)?.parent_ids().collect()));
+    }
+    let mut lists: HashMap<Oid, Option<Members>> = HashMap::new();
+    let mut at_cached = |id: Oid| -> Result<Option<Members>> {
+        if let Some(list) = lists.get(&id) {
+            return Ok(list.clone());
         }
-        Ok(lists[rev].clone())
+        let list = at(repo, &id.to_string())?;
+        lists.insert(id, list.clone());
+        Ok(list)
     };
-    let commits: Vec<Vec<&str>> = graph.lines().map(|l| l.split(' ').collect()).collect();
+    let mut signers = HashMap::new();
+    for (commit, _) in &commits {
+        signers.insert(*commit, signer(repo, *commit)?);
+    }
     // A trusted member's signed commit that starts the member list vouches
     // for the history beneath it: an imported vault's unsigned past.
     let mut introductions = Vec::new();
-    for line in &commits {
-        let (commit, parents) = (line[0], &line[1..]);
+    for (commit, parents) in &commits {
         let starts_list = parents.len() <= 1
-            && at_cached(commit)?.is_some()
+            && at_cached(*commit)?.is_some()
             && parents
                 .first()
-                .map(|p| at_cached(p))
+                .map(|p| at_cached(*p))
                 .transpose()?
                 .flatten()
                 .is_none();
-        if starts_list && signer(git, commit)?.is_some_and(|id| trusted.contains(&id)) {
-            introductions.push(commit);
+        if starts_list && signers[commit].is_some_and(|id| trusted.contains(&id)) {
+            introductions.push(*commit);
         }
     }
-    let vouched: HashSet<String> = if introductions.is_empty() {
-        HashSet::new()
-    } else {
-        let mut args = vec!["rev-list"];
-        args.extend(&introductions);
-        args.extend(["--not", head]);
-        git.run(args)?.lines().map(str::to_owned).collect()
-    };
-    for line in &commits {
-        let (commit, parents) = (line[0], &line[1..]);
+    let vouched = reachable(repo, &introductions, head)?;
+    // What lies beneath an edit a current member signed was taken in by that
+    // member. Only the local list counts here: a member list the vouched-for
+    // merge itself could have forged must not authorize its voucher. A merge's
+    // signature is never checked, so it vouches for nothing.
+    let signed: Vec<Oid> = commits
+        .iter()
+        .filter(|(id, parents)| {
+            parents.len() <= 1 && signers[id].is_some_and(|s| trusted.contains(&s))
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    let beneath_signed = reachable(repo, &signed, head)?;
+    for (commit, parents) in &commits {
+        let commit = *commit;
         let ours = at_cached(commit)?;
         if parents.len() > 1 {
             let mut member_era = ours.is_some();
             for p in parents {
-                member_era |= at_cached(p)?.is_some();
+                member_era |= at_cached(*p)?.is_some();
+            }
+            if !member_era {
+                continue;
             }
             // Merges are deterministic: whoever merges these parents makes this
             // exact commit, so one that differs (or invents a member list) was
             // forged.
-            if member_era && (parents.len() != 2 || merge(git, parents[0], parents[1])? != commit) {
-                bail!("merge {commit} is not the merge of its parents");
+            if is_current(repo.find_commit(commit)?.message_bytes()) {
+                if parents.len() != 2 || merge(repo, parents[0], parents[1])? != commit {
+                    bail!("merge {commit} is not the merge of its parents");
+                }
+            } else if !beneath_signed.contains(&commit) {
+                bail!(
+                    "merge {commit} is from an earlier vaultsync and no member signed on top of it"
+                );
             }
             continue;
         }
-        let signed_by = signer(git, commit)?;
-        match parents.first().map(|p| at_cached(p)).transpose()?.flatten() {
+        let signed_by = signers[&commit];
+        match parents
+            .first()
+            .map(|p| at_cached(*p))
+            .transpose()?
+            .flatten()
+        {
             // No member list at its parent: a root, or history from before the
             // vault had one. Only a current member may bring that in, by signing
             // it or the commit that starts the list on top of it; a removed
             // machine could otherwise start a fresh, unsigned line of history.
             None => {
-                if !signed_by.is_some_and(|id| trusted.contains(&id)) && !vouched.contains(commit) {
+                if !signed_by.is_some_and(|id| trusted.contains(&id)) && !vouched.contains(&commit)
+                {
                     bail!(
                         "commit {commit} has no member list behind it and no current member's signature"
                     );
