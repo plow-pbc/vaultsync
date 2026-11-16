@@ -15,32 +15,44 @@ struct VaultSyncBarApp: App {
     }
 }
 
-@Observable
+@MainActor @Observable
 final class Model {
     var vaults: [VaultStatus] = []
     var problem: String?
     private var timer: Timer?
+    private var refreshing = false
 
     init() {
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            self?.refresh()
+            Task { @MainActor in self?.refresh() }
         }
     }
 
+    /// Asks the CLI off the main thread, one request at a time, so a slow
+    /// answer never freezes the menu.
     func refresh() {
-        do {
-            vaults = try CLI.status()
-            problem = nil
-        } catch {
-            problem = error.localizedDescription
+        guard !refreshing else { return }
+        refreshing = true
+        Task.detached {
+            let result = Result { try CLI.status() }
+            await MainActor.run {
+                switch result {
+                case .success(let vaults):
+                    self.vaults = vaults
+                    self.problem = nil
+                case .failure(let error):
+                    self.problem = error.localizedDescription
+                }
+                self.refreshing = false
+            }
         }
     }
 
     /// Filled when every folder is in sync, an exclamation mark otherwise.
     var symbol: String {
         let healthy = problem == nil && vaults.allSatisfy {
-            $0.error == nil && $0.running == true && ($0.conflicts ?? []).isEmpty
+            $0.error == nil && $0.running == true && ($0.conflicts ?? []).isEmpty && ($0.pending ?? 0) == 0
         }
         return healthy ? "arrow.triangle.2.circlepath.circle.fill" : "exclamationmark.arrow.triangle.2.circlepath"
     }
@@ -85,6 +97,9 @@ struct MenuContent: View {
         if vault.running != true { return "\(vault.name) · not running" }
         let conflicts = vault.conflicts?.count ?? 0
         if conflicts > 0 { return "\(vault.name) · \(conflicts) conflict\(conflicts == 1 ? "" : "s")" }
+        if let pending = vault.pending, pending > 0 {
+            return "\(vault.name) · saving \(pending) change\(pending == 1 ? "" : "s")"
+        }
         guard let synced = vault.last_sync else { return "\(vault.name) · waiting for a machine" }
         return "\(vault.name) · synced \(ago(synced))"
     }

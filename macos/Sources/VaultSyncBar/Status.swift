@@ -39,8 +39,16 @@ enum CLI {
         process.standardOutput = out
         process.standardError = err
         try process.run()
+        // Drain stderr alongside stdout, so neither pipe can fill and stall git.
+        var errData = Data()
+        let drained = DispatchGroup()
+        drained.enter()
+        DispatchQueue.global().async {
+            errData = err.fileHandleForReading.readDataToEndOfFile()
+            drained.leave()
+        }
         let data = out.fileHandleForReading.readDataToEndOfFile()
-        let errData = err.fileHandleForReading.readDataToEndOfFile()
+        drained.wait()
         process.waitUntilExit()
         guard process.terminationStatus == 0 else {
             throw CLIError(message: String(decoding: errData, as: UTF8.self)
