@@ -68,18 +68,23 @@ case $(uname -s)-$(uname -m) in
     *) die "no build for $(uname -s) $(uname -m)" ;;
 esac
 
-say "Downloading vaultsync for $target"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
+# Downloads a release asset and its checksum into $tmp, and verifies it.
+fetch() {
+    for f in "$1" "$1.sha256"; do
+        curl -fsSL "$BASE/$f" -o "$tmp/$f" || return 1
+    done
+    if command -v sha256sum >/dev/null; then
+        (cd "$tmp" && sha256sum -c "$1.sha256" >/dev/null)
+    else
+        (cd "$tmp" && shasum -a 256 -c "$1.sha256" >/dev/null)
+    fi
+}
+
+say "Downloading vaultsync for $target"
 asset=vaultsync-$target.tar.gz
-for f in "$asset" "$asset.sha256"; do
-    curl -fsSL "$BASE/$f" -o "$tmp/$f" || die "could not download $BASE/$f"
-done
-if command -v sha256sum >/dev/null; then
-    (cd "$tmp" && sha256sum -c "$asset.sha256" >/dev/null) || die "checksum mismatch for $asset"
-else
-    (cd "$tmp" && shasum -a 256 -c "$asset.sha256" >/dev/null) || die "checksum mismatch for $asset"
-fi
+fetch "$asset" || die "could not download and verify $BASE/$asset"
 tar -xzf "$tmp/$asset" -C "$tmp"
 mkdir -p "$BIN_DIR"
 install -m 755 "$tmp/vaultsync" "$BIN"
@@ -133,6 +138,20 @@ EOF
     stop_service
     launchctl bootstrap "gui/$(id -u)" "$PLIST"
     say "Running as launchd agent '$NAME'; log: ~/Library/Logs/$NAME.log"
+    # The menu-bar app shows what the service syncs. A download by curl
+    # carries no quarantine flag, so macOS opens it however it is signed.
+    app="$HOME/Applications/BrainSync by Plow.app"
+    if fetch BrainSync-by-Plow.dmg; then
+        hdiutil attach -quiet -nobrowse -readonly -mountpoint "$tmp/dmg" "$tmp/BrainSync-by-Plow.dmg"
+        osascript -e 'quit app id "co.plow.vaultsync"' 2>/dev/null || true
+        mkdir -p "$HOME/Applications" && rm -rf "$app"
+        ditto "$tmp/dmg/BrainSync by Plow.app" "$app"
+        hdiutil detach -quiet "$tmp/dmg"
+        open "$app"
+        say "Installed the BrainSync menu-bar app in ~/Applications"
+    else
+        echo "install.sh: couldn't download the BrainSync app; syncing works without it" >&2
+    fi
 else
     mkdir -p "$(dirname "$UNIT")"
     cat > "$UNIT" <<EOF
