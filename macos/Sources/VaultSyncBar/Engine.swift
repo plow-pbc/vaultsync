@@ -47,8 +47,10 @@ final class Engine {
         }
     }
 
+    /// Whether this is the App Store build, inside the App Sandbox.
+    static let sandboxed = ProcessInfo.processInfo.environment["APP_SANDBOX_CONTAINER_ID"] != nil
+
     private static var serviceRunsVaults: Bool {
-        let sandboxed = ProcessInfo.processInfo.environment["APP_SANDBOX_CONTAINER_ID"] != nil
         let service = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/LaunchAgents/vaultsync.plist")
         return !sandboxed && FileManager.default.fileExists(atPath: service.path)
