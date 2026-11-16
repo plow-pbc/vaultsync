@@ -71,7 +71,7 @@ enum Cmd {
         /// Only commits touching this path (relative to the vault).
         path: Option<PathBuf>,
     },
-    /// Restore the vault, or one path, to a prior commit as a new commit.
+    /// Restore the vault, or some of its paths, to a prior commit as a new commit.
     Rollback {
         commit: String,
         /// Paths relative to the vault, all in one commit; none for the whole vault.
