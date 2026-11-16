@@ -18,19 +18,15 @@ struct VaultSyncBarApp: App {
     }
 }
 
-/// Starts the engine with the app, opens at login unless the user turned
-/// that off, and stops the engine on quit.
+/// Starts the engine with the app, and opens at login unless the user
+/// turned that off.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         if !UserDefaults.standard.bool(forKey: "loginItemChosen") {
             try? SMAppService.mainApp.register()
             UserDefaults.standard.set(true, forKey: "loginItemChosen")
         }
-        MainActor.assumeIsolated { Engine.shared.restart() }
-    }
-
-    func applicationWillTerminate(_ notification: Notification) {
-        MainActor.assumeIsolated { Engine.shared.stop() }
+        MainActor.assumeIsolated { Engine.shared.start() }
     }
 }
 

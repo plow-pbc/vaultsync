@@ -1,5 +1,6 @@
 import AppKit
 
+@MainActor
 enum Actions {
     static func openInObsidian(_ vault: VaultStatus) {
         open(path: vault.folder)
@@ -85,8 +86,8 @@ enum Actions {
         return panel.runModal() == .OK ? panel.url : nil
     }
 
-    /// Keeps access to the folder, runs `work` (a join waits on the network)
-    /// off the main thread, then restarts the engine so it holds the folder.
+    /// Keeps access to the folder, then runs `work` (a join waits on the
+    /// network) off the main thread; the engine picks the folder up itself.
     private static func inBackground(
         granting url: URL,
         failure: String,
@@ -102,9 +103,8 @@ enum Actions {
         Task.detached {
             let result = Result { try work() }
             await MainActor.run {
-                switch result {
-                case .success: Engine.shared.restart()
-                case .failure(let error): alert(failure, error.localizedDescription)
+                if case .failure(let error) = result {
+                    alert(failure, error.localizedDescription)
                 }
                 done()
             }
