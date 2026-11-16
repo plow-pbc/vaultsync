@@ -60,8 +60,6 @@ if [ -n "$uninstall" ]; then
     exit 0
 fi
 
-command -v git >/dev/null || die "vaultsync needs git; install it first"
-
 case $(uname -s)-$(uname -m) in
     Darwin-arm64) target=aarch64-apple-darwin ;;
     Darwin-x86_64) target=x86_64-apple-darwin ;;

@@ -1,18 +1,17 @@
 //! The wire between members: one iroh connection per request, one stream.
 //!
-//! Client → server: `VS0`, a kind byte, then for a fetch the commit ids the
+//! Client → server: `VS1`, a kind byte, then for a fetch the commit ids the
 //! client has (one per line). Server → client: a status byte, then for a
-//! fetch a git bundle of what the client lacks. Peers only ever fetch; no peer
+//! fetch the head's id on a line and a git pack of what the client lacks. Peers only ever fetch; no peer
 //! writes into another's repository. A connection from a node that is not on
 //! the member list is closed before it can ask anything.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use iroh::endpoint::{Connection, Incoming, QuicTransportConfig, presets};
+use iroh::endpoint::{Connection, ConnectionError, Incoming, QuicTransportConfig, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::UnboundedSender;
@@ -22,12 +21,14 @@ use tokio::time::timeout;
 use crate::vault::Vault;
 
 const ALPN: &[u8] = b"vaultsync/0";
-const MAGIC: &[u8] = b"VS0";
+const MAGIC: &[u8] = b"VS1";
+/// What the first release, which sent git bundles, opens a request with.
+const OLD_MAGIC: &[u8] = b"VS0";
 const FETCH: u8 = 1;
 const POKE: u8 = 2;
 /// The one request a non-member may make: a joining machine with an invite.
 const JOIN: u8 = 3;
-const BUNDLE_FOLLOWS: u8 = 0;
+const PACK_FOLLOWS: u8 = 0;
 const NOTHING_NEW: u8 = 1;
 const REFUSED: u8 = 2;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -133,6 +134,13 @@ impl Net {
         recv.read_exact(&mut status)
             .await
             .map_err(|e| match conn.close_reason() {
+                // The first release drops a request it can't read, unanswered.
+                Some(ConnectionError::ApplicationClosed(close)) if close.reason.is_empty() => {
+                    anyhow::anyhow!(
+                        "{} closed the connection without answering; it may run an older vaultsync: upgrade it",
+                        peer.fmt_short()
+                    )
+                }
                 Some(reason) => anyhow::anyhow!("{reason}"),
                 None => e.into(),
             })?;
@@ -157,13 +165,13 @@ impl Net {
             let (conn, mut recv, status) = self
                 .request(peer, FETCH, haves.join("\n").as_bytes())
                 .await?;
-            if status == BUNDLE_FOLLOWS {
+            if status == PACK_FOLLOWS {
                 let mut file = tokio::fs::File::create(&path).await?;
                 tokio::io::copy(&mut recv, &mut file).await?;
                 file.flush().await?;
             }
             conn.close(0u32.into(), b"done");
-            anyhow::Ok(status == BUNDLE_FOLLOWS)
+            anyhow::Ok(status == PACK_FOLLOWS)
         })
         .await
         .context("fetch timed out")
@@ -178,7 +186,7 @@ impl Net {
         spawn_blocking(move || v.receive(&peer, &path)).await?
     }
 
-    /// Presents an invite secret to `inviter` and returns the bundle of the
+    /// Presents an invite secret to `inviter` and returns the pack of the
     /// vault's history it sends back.
     pub async fn join(
         &self,
@@ -192,7 +200,7 @@ impl Net {
             .request(inviter, JOIN, &body)
             .await
             .context("could not reach the inviting machine (is `vaultsync run` running there?)")?;
-        if status != BUNDLE_FOLLOWS {
+        if status != PACK_FOLLOWS {
             let reason = recv.read_to_end(1024).await.unwrap_or_default();
             conn.close(0u32.into(), b"done");
             bail!("{}", String::from_utf8_lossy(&reason));
@@ -230,6 +238,17 @@ async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>
     let mut header = [0u8; 4];
     timeout(REQUEST_TIMEOUT, recv.read_exact(&mut header)).await??;
     let kind = header[3];
+    if &header[..3] == OLD_MAGIC {
+        eprintln!(
+            "refused {}: it runs an older vaultsync; upgrade it",
+            peer.fmt_short()
+        );
+        conn.close(
+            1u32.into(),
+            b"this machine runs a newer vaultsync: upgrade vaultsync here to keep syncing",
+        );
+        return Ok(());
+    }
     if &header[..3] != MAGIC {
         bail!("{} sent a malformed request", peer.fmt_short());
     }
@@ -254,7 +273,7 @@ async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>
                 .collect();
             pause_if_hooked("pause-before-snapshot").await;
             let v = vault.clone();
-            // One snapshot: membership is judged, and the bundle cut, at the
+            // One snapshot: membership is judged, and the pack cut, at the
             // same commit, so a removal can't land between the two.
             let (head, present, news) = spawn_blocking(move || {
                 let head = v.head()?;
@@ -268,7 +287,7 @@ async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>
             .await??;
             pause_if_hooked("pause-after-snapshot").await;
             if news {
-                send_bundle(&vault, &head, &present, &mut send).await?;
+                send_pack(&vault, &head, &present, &mut send).await?;
             } else {
                 send.write_all(&[NOTHING_NEW]).await?;
             }
@@ -301,7 +320,7 @@ async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>
                     eprintln!("{name} ({}) joined", peer.fmt_short());
                     // Tell the other members about the newcomer.
                     let _ = events.send(Event::Edited);
-                    send_bundle(&vault, &admission, &[], &mut send).await?;
+                    send_pack(&vault, &admission, &[], &mut send).await?;
                 }
                 Err(e) => {
                     eprintln!("refused join from {}: {e:#}", peer.fmt_short());
@@ -318,29 +337,18 @@ async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>
     Ok(())
 }
 
-/// Streams a bundle of `head`, less what the peer `haves`.
-async fn send_bundle(
+/// Sends `head` and a pack of what it holds beyond the peer's `haves`.
+async fn send_pack(
     vault: &Vault,
     head: &str,
     haves: &[String],
     send: &mut noq::SendStream,
 ) -> Result<()> {
-    let pinned = vault.pin(head)?;
-    let sent = async {
-        send.write_all(&[BUNDLE_FOLLOWS]).await?;
-        let mut child = tokio::process::Command::from(vault.bundle_command(&pinned, haves))
-            .stdout(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
-        tokio::io::copy(child.stdout.as_mut().expect("piped"), send).await?;
-        if !child.wait().await?.success() {
-            bail!("git bundle failed");
-        }
-        anyhow::Ok(())
-    }
-    .await;
-    vault.unpin(&pinned)?;
-    sent
+    let (v, head, haves) = (vault.clone(), head.to_owned(), haves.to_vec());
+    let pack = spawn_blocking(move || v.pack(&head, &haves)).await??;
+    send.write_all(&[PACK_FOLLOWS]).await?;
+    send.write_all(&pack).await?;
+    Ok(())
 }
 
 /// Test hook: hold a request at a named point for 5 s.

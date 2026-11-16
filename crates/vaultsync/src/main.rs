@@ -1,13 +1,3 @@
-mod config;
-mod daemon;
-mod git;
-mod join;
-mod members;
-mod merge;
-mod net;
-mod status;
-mod vault;
-
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -15,7 +5,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use iroh::EndpointId;
 
-use vault::Vault;
+use vaultsync::vault::Vault;
+use vaultsync::{config, daemon, join, members, status};
 
 /// Keeps a folder of notes in sync across machines, with full history.
 #[derive(Parser)]
