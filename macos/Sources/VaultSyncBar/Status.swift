@@ -15,6 +15,7 @@ struct VaultStatus: Decodable, Identifiable {
     let machine: String?
     let pending: Int?
     let running: Bool?
+    let started: Bool?
     let last_sync: Int?
     let peers: [Peer]?
     let conflicts: [String]?

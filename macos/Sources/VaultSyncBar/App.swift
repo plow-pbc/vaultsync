@@ -23,9 +23,14 @@ struct VaultSyncBarApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         if !UserDefaults.standard.bool(forKey: "loginItemChosen") {
-            try? SMAppService.mainApp.register()
+            do {
+                try SMAppService.mainApp.register()
+            } catch {
+                NSLog("VaultSync: couldn't open at login: \(error.localizedDescription)")
+            }
             UserDefaults.standard.set(true, forKey: "loginItemChosen")
         }
+        NSLog("VaultSync: open at login: \(SMAppService.mainApp.status.rawValue)")
         MainActor.assumeIsolated { Engine.shared.start() }
     }
 }
@@ -88,9 +93,10 @@ struct MenuContent: View {
                 if let error = vault.error {
                     Text(error)
                 } else {
-                    Text("● \(vault.machine ?? "") (this Mac)")
+                    // Menu text is drawn gray; the dots' color carries the state.
+                    Text("🟢 \(vault.machine ?? "") (this Mac)")
                     ForEach(vault.peers ?? []) { peer in
-                        Text(peer.online ? "● \(peer.name)" : "○ \(peer.name)\(seen(peer.last_seen))")
+                        Text(peer.online ? "🟢 \(peer.name)" : "⚪️ \(peer.name)\(seen(peer.last_seen))")
                     }
                     ForEach(vault.conflicts ?? [], id: \.self) { file in
                         Button("Conflict: \(file)") { Actions.open(file: file, in: vault) }
@@ -113,7 +119,9 @@ struct MenuContent: View {
 
     private func header(_ vault: VaultStatus) -> String {
         if vault.error != nil { return "\(vault.name) · can't read it" }
-        if vault.running != true { return "\(vault.name) · not running" }
+        if vault.running != true {
+            return "\(vault.name) · \(vault.started == false ? "starting…" : "not running")"
+        }
         let conflicts = vault.conflicts?.count ?? 0
         if conflicts > 0 { return "\(vault.name) · \(conflicts) conflict\(conflicts == 1 ? "" : "s")" }
         if let pending = vault.pending, pending > 0 {

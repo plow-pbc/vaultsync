@@ -77,6 +77,8 @@ pub fn json(vault: &Vault) -> Result<Value> {
         "head": vault.head()?,
         "pending": vault.pending()?,
         "running": updated.is_some_and(fresh),
+        // False until the engine has first run this vault (just added).
+        "started": updated.is_some(),
         "last_sync": seen.last_sync,
         "peers": peers,
         "conflicts": vault.conflicts()?,

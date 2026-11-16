@@ -432,19 +432,7 @@ fn rollback_restores_prior_version_as_new_commit() {
 fn one_service_runs_every_tracked_vault_including_ones_added_later() {
     let tmp = tempfile::tempdir().unwrap();
     let config = tmp.path().join("config");
-    let run = |args: &[&str]| {
-        let out = bin()
-            .env("VAULTSYNC_CONFIG_DIR", &config)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8(out.stdout).unwrap()
-    };
+    let run = |args: &[&str]| run_with_config(&config, args);
     let folder = |name: &str| {
         tmp.path()
             .join(name)
@@ -563,4 +551,36 @@ fn rollback_of_a_folder_keeps_names_that_are_not_utf8() {
     for name in names {
         assert_eq!(fs::read_to_string(file(name)).unwrap(), "v1\n");
     }
+}
+
+#[test]
+fn a_new_vault_takes_the_name_this_machine_already_uses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = tmp.path().join("config");
+    let run = |args: &[&str]| run_with_config(&config, args);
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    run(&["init", a.to_str().unwrap(), "--machine", "air"]);
+    assert!(run(&["init", b.to_str().unwrap()]).contains("machine: air"));
+
+    // No engine has run it yet: not stopped, just not started.
+    let status: serde_json::Value =
+        serde_json::from_str(&run(&["--vault", b.to_str().unwrap(), "status", "--json"])).unwrap();
+    assert_eq!(status["started"], false, "{status}");
+    assert_eq!(status["running"], false, "{status}");
+}
+
+/// Runs vaultsync with its own settings directory; its output.
+fn run_with_config(config: &Path, args: &[&str]) -> String {
+    let out = bin()
+        .env("VAULTSYNC_CONFIG_DIR", config)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
 }
