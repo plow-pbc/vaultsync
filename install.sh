@@ -141,6 +141,7 @@ EOF
     say "Running as launchd agent '$NAME'; log: ~/Library/Logs/$NAME.log"
     # The menu-bar app shows what the service syncs. A download by curl
     # carries no quarantine flag, so macOS opens it however it is signed.
+    # Without it a Mac has no sign of syncing, so failing to get it is an error.
     app="$HOME/Applications/BrainSync by Plow.app"
     if fetch BrainSync-by-Plow.dmg; then
         hdiutil attach -quiet -nobrowse -readonly -mountpoint "$tmp/dmg" "$tmp/BrainSync-by-Plow.dmg"
@@ -151,7 +152,7 @@ EOF
         open "$app"
         say "Installed the BrainSync menu-bar app in ~/Applications"
     else
-        echo "install.sh: couldn't download the BrainSync app; syncing works without it" >&2
+        die "syncing is set up, but the BrainSync app couldn't be downloaded from $BASE; run this again"
     fi
 else
     mkdir -p "$(dirname "$UNIT")"
