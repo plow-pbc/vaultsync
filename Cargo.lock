@@ -3407,6 +3407,15 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 name = "vaultsync"
 version = "0.2.0"
 dependencies = [
+ "serde_json",
+ "tempfile",
+ "vaultsync-engine",
+]
+
+[[package]]
+name = "vaultsync-engine"
+version = "0.2.0"
+dependencies = [
  "anyhow",
  "blake3",
  "clap",
@@ -3417,7 +3426,6 @@ dependencies = [
  "notify-debouncer-mini",
  "rand",
  "serde_json",
- "tempfile",
  "tokio",
 ]
 
