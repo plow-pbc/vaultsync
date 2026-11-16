@@ -7,6 +7,8 @@
 #   NOTARY_PROFILE=other build.sh
 #   APPLE_ID=… APPLE_PASSWORD=… APPLE_TEAM_ID=… build.sh   notarize with an Apple ID (CI)
 #   SIGN=- build.sh               ad-hoc signed, not notarized (local testing)
+#   SANDBOX=1 build.sh            with the App Sandbox (the App Store build); without
+#                                 it the app shares the command-line tool's vaults
 #
 # The engine (crates/ffi) is linked in as a static library; build-engine.sh
 # makes it.
@@ -17,6 +19,8 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml)
 SIGN=${SIGN:-Developer ID Application: The Plow Collective, Inc (3559PD337Z)}
 NOTARY_PROFILE=${NOTARY_PROFILE:-plow-notary}
 APP="build/BrainSync by Plow.app"
+ENTITLEMENTS=
+if [ "${SANDBOX:-0}" = 1 ]; then ENTITLEMENTS=VaultSync.entitlements; fi
 DMG=build/BrainSync-by-Plow.dmg
 
 ./build-engine.sh
@@ -58,12 +62,12 @@ dmg() {
     rm -rf build/dmg
 }
 if [ "$SIGN" = - ]; then
-    codesign --force --sign - --entitlements VaultSync.entitlements "$APP"
+    codesign --force --sign - ${ENTITLEMENTS:+--entitlements "$ENTITLEMENTS"} "$APP"
     dmg
     echo "$DMG (ad-hoc signed, not notarized)"
     exit 0
 fi
-codesign --force --options runtime --timestamp --entitlements VaultSync.entitlements --sign "$SIGN" "$APP"
+codesign --force --options runtime --timestamp ${ENTITLEMENTS:+--entitlements "$ENTITLEMENTS"} --sign "$SIGN" "$APP"
 dmg
 codesign --force --timestamp --sign "$SIGN" "$DMG"
 if [ -n "${APPLE_ID:-}" ]; then
