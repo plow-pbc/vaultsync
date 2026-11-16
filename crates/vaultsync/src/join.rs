@@ -90,7 +90,6 @@ pub fn join(
         (Some(rel), Some(home)) => home.join(rel),
         _ => PathBuf::from(&invite.folder),
     });
-    crate::config::refuse_overlap(&folder)?;
     let (vault, created) = Vault::for_join(&folder, machine)?;
     let result = tokio::runtime::Runtime::new()?.block_on(async {
         let net = Net::bind(vault.secret_key()?, addr_dir.as_deref()).await?;

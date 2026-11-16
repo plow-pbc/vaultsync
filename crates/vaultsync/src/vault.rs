@@ -60,8 +60,15 @@ impl Vault {
     /// inside the folder is moved beside it, and one already beside it is used
     /// as is. A folder with no history gets a first commit of its contents.
     pub fn init(folder: &Path, machine: Option<String>) -> Result<Vault> {
+        let created = !folder.exists();
         fs::create_dir_all(folder)?;
         let vault = Vault::at(folder.canonicalize()?);
+        if let Err(e) = crate::config::refuse_overlap(vault.folder()) {
+            if created {
+                fs::remove_dir(vault.folder())?;
+            }
+            return Err(e);
+        }
         let inner = vault.folder().join(".git");
         let beside = &vault.git.git_dir;
         // Check existing history before moving anything.
@@ -307,6 +314,7 @@ impl Vault {
         let folder = folder
             .canonicalize()
             .or_else(|_| parent.canonicalize().map(|p| p.join(name)))?;
+        crate::config::refuse_overlap(&folder)?;
         let has_files = match fs::read_dir(&folder) {
             Ok(mut entries) => entries.next().is_some(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,

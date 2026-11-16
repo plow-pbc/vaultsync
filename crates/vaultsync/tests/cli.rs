@@ -380,7 +380,10 @@ fn one_service_runs_every_tracked_vault_including_ones_added_later() {
     run(&["--vault", folder("a").to_str().unwrap(), "track"]);
     assert_eq!(fs::read_dir(config.join("vaults")).unwrap().count(), 2);
     // A vault may be neither inside the settings nor around them.
-    let around = tmp.path().join("a/../config/notes");
+    // Spelled elsewhere, landing there: `..` after a symlinked folder.
+    fs::create_dir(tmp.path().join("sibling")).unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("sibling"), tmp.path().join("alias")).unwrap();
+    let around = tmp.path().join("alias/../config/notes");
     for overlapping in [config.join("notes"), tmp.path().to_owned(), around] {
         let out = bin()
             .env("VAULTSYNC_CONFIG_DIR", &config)

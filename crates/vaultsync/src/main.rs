@@ -126,7 +126,6 @@ fn main() -> Result<()> {
     let open = || Vault::open(&cli.vault);
     match cli.command {
         Cmd::Init { folder, machine } => {
-            config::refuse_overlap(&folder)?;
             let vault = Vault::init(&folder, machine)?;
             config::track(vault.folder())?;
             print!("{}", vault.status()?);
