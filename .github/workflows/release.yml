@@ -74,21 +74,19 @@ jobs:
         run: |
           if [ -z "$APPLE_CERTIFICATE" ]; then
             echo "::notice::no signing secrets; the app is ad-hoc signed"
-            SIGN=- macos/build.sh
-            mkdir dist && cp macos/build/BrainSync-by-Plow.dmg dist/
-            (cd dist && shasum -a 256 BrainSync-by-Plow.dmg > BrainSync-by-Plow.dmg.sha256)
-            exit 0
+            export SIGN=-
+          else
+            KEYCHAIN=$RUNNER_TEMP/signing.keychain-db
+            KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
+            security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+            security set-keychain-settings -lut 21600 "$KEYCHAIN"
+            security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+            echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+            security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
+            rm "$RUNNER_TEMP/cert.p12"
+            security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+            security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           fi
-          KEYCHAIN=$RUNNER_TEMP/signing.keychain-db
-          KEYCHAIN_PASSWORD=$(openssl rand -base64 32)
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
-          security import "$RUNNER_TEMP/cert.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN"
-          rm "$RUNNER_TEMP/cert.p12"
-          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           macos/build.sh
           mkdir dist && cp macos/build/BrainSync-by-Plow.dmg dist/
           (cd dist && shasum -a 256 BrainSync-by-Plow.dmg > BrainSync-by-Plow.dmg.sha256)
