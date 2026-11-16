@@ -21,7 +21,7 @@ APP=build/VaultSync.app
 mkdir -p lib
 for target in aarch64-apple-darwin x86_64-apple-darwin; do
     if command -v cargo >/dev/null; then
-        cargo build --release --locked -p vaultsync-ffi --target "$target" --manifest-path ../Cargo.toml
+        MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release --locked -p vaultsync-ffi --target "$target" --manifest-path ../Cargo.toml
         cp "../target/$target/release/libvaultsync_ffi.a" "lib/libvaultsync_ffi-$target.a"
     fi
     [ -f "lib/libvaultsync_ffi-$target.a" ] || { echo "build.sh: no engine library for $target" >&2; exit 1; }

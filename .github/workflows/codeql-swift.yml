@@ -28,6 +28,8 @@ jobs:
       # Both architectures, as build.sh makes it: CodeQL's traced Swift build
       # links for x86_64 even on an arm64 runner.
       - name: Engine library
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '14.0'
         run: |
           mkdir -p macos/lib
           for target in aarch64-apple-darwin x86_64-apple-darwin; do

@@ -18,6 +18,9 @@ let package = Package(
                 .linkedFramework("CoreFoundation"),
                 .linkedLibrary("resolv"),
                 .linkedLibrary("iconv"),
+                // libgit2's zlib: bundled in a cross-built engine library,
+                // the system's when cargo builds it on a Mac.
+                .linkedLibrary("z"),
             ]
         ),
     ]
