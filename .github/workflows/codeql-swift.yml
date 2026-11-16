@@ -1,0 +1,40 @@
+# The Mac app links the engine as a static library, so CodeQL's automatic
+# build can't compile it: build the library first, then the app.
+name: CodeQL (Swift)
+on:
+  push:
+    branches: [main]
+    paths: ['macos/**', 'crates/**', 'Cargo.*', '.github/workflows/codeql-swift.yml']
+  pull_request:
+    paths: ['macos/**', 'crates/**', 'Cargo.*', '.github/workflows/codeql-swift.yml']
+  schedule:
+    - cron: '17 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: macos-15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Engine library
+        run: |
+          cargo build --release --locked -p vaultsync-ffi
+          mkdir -p macos/lib
+          cp target/release/libvaultsync_ffi.a macos/lib/
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: swift
+          build-mode: manual
+      - name: Build the app
+        working-directory: macos
+        run: swift build -c release
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:swift
