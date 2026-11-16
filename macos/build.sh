@@ -9,7 +9,7 @@
 set -eu
 cd "$(dirname "$0")"
 
-VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' ../crates/vaultsync/Cargo.toml)
+VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml)
 SIGN=${SIGN:-Developer ID Application: The Plow Collective, Inc (3559PD337Z)}
 NOTARY_PROFILE=${NOTARY_PROFILE:-plow-notary}
 APP=build/VaultSync.app
