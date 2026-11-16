@@ -7,9 +7,8 @@
 #   APPLE_ID=… APPLE_PASSWORD=… APPLE_TEAM_ID=… build.sh   notarize with an Apple ID (CI)
 #   SIGN=- build.sh               ad-hoc signed, not notarized (local testing)
 #
-# The engine (crates/ffi) is linked in as a static library: built here with
-# cargo when Rust is installed, else from lib/libvaultsync_ffi-<target>.a for
-# both targets (scripts/macos-engine.sh cross-builds them on Linux).
+# The engine (crates/ffi) is linked in as a static library; build-engine.sh
+# makes it.
 set -eu
 cd "$(dirname "$0")"
 
@@ -18,15 +17,7 @@ SIGN=${SIGN:-Developer ID Application: The Plow Collective, Inc (3559PD337Z)}
 NOTARY_PROFILE=${NOTARY_PROFILE:-plow-notary}
 APP=build/VaultSync.app
 
-mkdir -p lib
-for target in aarch64-apple-darwin x86_64-apple-darwin; do
-    if command -v cargo >/dev/null; then
-        MACOSX_DEPLOYMENT_TARGET=14.0 cargo build --release --locked -p vaultsync-ffi --target "$target" --manifest-path ../Cargo.toml
-        cp "../target/$target/release/libvaultsync_ffi.a" "lib/libvaultsync_ffi-$target.a"
-    fi
-    [ -f "lib/libvaultsync_ffi-$target.a" ] || { echo "build.sh: no engine library for $target" >&2; exit 1; }
-done
-lipo -create -output lib/libvaultsync_ffi.a lib/libvaultsync_ffi-aarch64-apple-darwin.a lib/libvaultsync_ffi-x86_64-apple-darwin.a
+./build-engine.sh
 
 # One build per architecture, joined: a multi-arch `swift build` needs Xcode.
 set --
