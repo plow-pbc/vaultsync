@@ -35,6 +35,11 @@ pub fn ok(vault: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap()
 }
 
+/// Where a vault keeps its history.
+pub fn history_dir(folder: &Path) -> PathBuf {
+    folder.join(".vaultsync")
+}
+
 /// Plain git, independent of the code under test.
 pub fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
@@ -203,7 +208,7 @@ impl Node {
         git(
             Path::new("."),
             &[
-                &format!("--git-dir={}.git", self.folder.display()),
+                &format!("--git-dir={}", history_dir(&self.folder).display()),
                 "rev-parse",
                 "HEAD",
             ],

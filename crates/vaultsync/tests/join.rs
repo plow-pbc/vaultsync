@@ -2,10 +2,10 @@ use std::fs;
 use std::time::Duration;
 
 mod common;
-use common::{AFTER_RESTART, Mesh, Node, git, ok, vaultsync, wait_until};
+use common::{AFTER_RESTART, Mesh, Node, git, history_dir, ok, vaultsync, wait_until};
 
 fn history(node: &Node) -> String {
-    let gd = format!("--git-dir={}.git", node.folder.display());
+    let gd = format!("--git-dir={}", history_dir(&node.folder).display());
     git(&node.folder, &[&gd, "rev-list", "HEAD"])
 }
 
@@ -54,7 +54,7 @@ fn an_invite_works_once_and_not_after_it_expires() {
         .expect("reuse must fail");
     assert!(reused.contains("already used"), "{reused}");
     assert!(
-        !root.join("second").exists() && !root.join("second.git").exists(),
+        !root.join("second").exists(),
         "a failed join leaves nothing behind"
     );
 
@@ -302,13 +302,16 @@ fn a_fetch_that_began_before_a_removal_gets_nothing_after_it() {
         // that m1 is refused outright.
         let done = || mesh.nodes[0].log_text().contains(settled);
         assert!(wait_until(20, done), "{point}: {}", mesh.logs());
-        let gd0 = format!("--git-dir={}.git", mesh.nodes[0].folder.display());
+        let gd0 = format!("--git-dir={}", history_dir(&mesh.nodes[0].folder).display());
         let blob = git(
             &mesh.nodes[0].folder,
             &[&gd0, "rev-parse", "HEAD:secret.md"],
         );
         let in_m1 = std::process::Command::new("git")
-            .arg(format!("--git-dir={}.git", mesh.nodes[1].folder.display()))
+            .arg(format!(
+                "--git-dir={}",
+                history_dir(&mesh.nodes[1].folder).display()
+            ))
             .args(["cat-file", "-e", blob.trim()])
             .status()
             .unwrap();
@@ -348,7 +351,7 @@ fn a_failed_join_keeps_files_it_did_not_write() {
         .spawn()
         .unwrap();
     // While the join waits on the inviter, an editor saves into the folder.
-    assert!(wait_until(10, || folder.with_extension("git").exists()));
+    assert!(wait_until(10, || history_dir(&folder).exists()));
     fs::write(folder.join("typed-meanwhile.md"), "keep me\n").unwrap();
     mesh.nodes[0].stop();
 
@@ -362,7 +365,7 @@ fn a_failed_join_keeps_files_it_did_not_write() {
         "keep me\n"
     );
     assert!(
-        !folder.with_extension("git").exists(),
+        !history_dir(&folder).exists(),
         "join's own history is cleaned up"
     );
 }

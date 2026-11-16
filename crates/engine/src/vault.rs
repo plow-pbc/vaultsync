@@ -21,8 +21,12 @@ const MACHINE_KEY: &str = "vaultsync.machine";
 /// Tries before giving up on landing a sync over files that keep changing.
 const APPLY_TRIES: usize = 5;
 
-/// A folder of notes whose git directory sits beside it (`<folder>.git`), so
-/// editors and agents never see `.git`.
+/// Where a vault keeps its history: a hidden folder inside it, so that a
+/// sandboxed app's access to the folder covers it, and named other than
+/// `.git`, so editors and agents don't take the folder for a repository.
+pub const HISTORY: &str = ".vaultsync";
+
+/// A folder of notes with its history in [`HISTORY`] inside it.
 #[derive(Clone)]
 pub struct Vault {
     git_dir: PathBuf,
@@ -30,9 +34,40 @@ pub struct Vault {
 }
 
 fn git_dir_for(folder: &Path) -> PathBuf {
+    folder.join(HISTORY)
+}
+
+/// Where the first releases kept a vault's history: beside it, `<folder>.git`.
+fn beside(folder: &Path) -> PathBuf {
     let mut dir = folder.as_os_str().to_owned();
     dir.push(".git");
     dir.into()
+}
+
+/// Whether `tree` would write into a vault's history folder, in any case
+/// (macOS folders don't tell `.VaultSync` from `.vaultsync`).
+fn writes_into_history(tree: &Tree) -> bool {
+    tree.iter()
+        .any(|e| e.name_bytes().eq_ignore_ascii_case(HISTORY.as_bytes()))
+}
+
+/// Adds `line` to `file` unless it is there already.
+fn ensure_line(file: &Path, line: &str) -> Result<()> {
+    let existing = fs::read_to_string(file).unwrap_or_default();
+    if existing.lines().any(|l| l == line) {
+        return Ok(());
+    }
+    let mut text = format!("{line}\n");
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        text.insert(0, '\n');
+    }
+    fs::create_dir_all(file.parent().expect("has a parent"))?;
+    fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(file)?
+        .write_all(text.as_bytes())?;
+    Ok(())
 }
 
 /// Where a fetched peer head is kept.
@@ -119,6 +154,11 @@ impl Vault {
         &self.folder
     }
 
+    /// The history folder.
+    pub fn history(&self) -> &Path {
+        &self.git_dir
+    }
+
     pub fn repo(&self) -> Result<Repository> {
         open_repo(&self.git_dir, &self.folder)
     }
@@ -131,8 +171,8 @@ impl Vault {
     }
 
     /// Makes `folder` a vault. Existing history is adopted untouched: a `.git`
-    /// inside the folder is moved beside it, and one already beside it is used
-    /// as is. A folder with no history gets a first commit of its contents.
+    /// inside the folder, or one beside it, is moved into [`HISTORY`]. A folder
+    /// with no history gets a first commit of its contents.
     pub fn init(folder: &Path, machine: Option<String>) -> Result<Vault> {
         let created = !folder.exists();
         fs::create_dir_all(folder)?;
@@ -144,28 +184,40 @@ impl Vault {
             return Err(e);
         }
         let inner = vault.folder().join(".git");
-        let beside = &vault.git_dir;
+        if fs::symlink_metadata(&inner).is_ok_and(|m| !m.is_dir()) {
+            bail!(
+                "{} is not a git directory; refusing to adopt it",
+                inner.display()
+            );
+        }
+        let found: Vec<PathBuf> = [inner, beside(vault.folder()), vault.git_dir.clone()]
+            .into_iter()
+            .filter(|d| d.is_dir())
+            .collect();
         // Check existing history before moving anything.
-        for git_dir in [&inner, beside].into_iter().filter(|d| d.is_dir()) {
+        for git_dir in &found {
             branch(&open_repo(git_dir, vault.folder())?)
                 .with_context(|| format!("HEAD in {} must be on a branch", git_dir.display()))?;
         }
-        match (fs::symlink_metadata(&inner).ok(), beside.exists()) {
-            (Some(meta), false) if meta.is_dir() => {
-                fs::rename(&inner, beside).context("moving .git beside the folder")?
+        match found.as_slice() {
+            [] => drop(create_repo(&vault.git_dir)?),
+            [one] if *one == vault.git_dir => {}
+            [one] => {
+                fs::rename(one, &vault.git_dir).context("moving the history into the folder")?
             }
-            (Some(_), _) => bail!(
-                "{} has its own .git and {} also exists; refusing to choose between them",
+            many => bail!(
+                "{} has more than one history ({}); refusing to choose between them",
                 vault.folder().display(),
-                beside.display()
+                many.iter()
+                    .map(|d| d.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
-            (None, true) => {}
-            (None, false) => drop(create_repo(beside)?),
         }
         let repo = vault.repo()?;
         let fresh = repo.head().is_err();
         // A bare snapshot has no index; build it from HEAD without touching refs.
-        if !fresh && !beside.join("index").exists() {
+        if !fresh && !vault.git_dir.join("index").exists() {
             let mut index = repo.index()?;
             index.read_tree(&repo.head()?.peel_to_tree()?)?;
             index.write()?;
@@ -173,7 +225,7 @@ impl Vault {
         let machine =
             machine.unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned());
         repo.config()?.set_str(MACHINE_KEY, &machine)?;
-        vault.ensure_union_merge()?;
+        vault.ensure_rules()?;
         if fresh {
             vault.stage_all(&repo)?;
             vault.commit(&repo, "Initialize vault")?;
@@ -186,31 +238,53 @@ impl Vault {
         let start = start.canonicalize()?;
         for dir in start.ancestors() {
             let vault = Vault::at(dir.to_owned());
-            if vault.git_dir.is_dir() && vault.machine().is_ok() {
-                vault.ensure_union_merge()?;
+            if !vault.git_dir.is_dir() && Vault::is_vault(&beside(dir), dir) {
+                vault.move_history_inside()?;
+            }
+            if Vault::is_vault(&vault.git_dir, dir) {
+                vault.ensure_rules()?;
                 return Ok(vault);
             }
         }
         bail!("no vault at or above {}", start.display())
     }
 
-    /// Concurrent member additions merge as a union, never as markers.
-    fn ensure_union_merge(&self) -> Result<()> {
-        let attributes = self.git_dir.join("info").join("attributes");
-        let existing = fs::read_to_string(&attributes).unwrap_or_default();
-        let mut rule = format!("{MEMBERS_PATH} merge=union\n");
-        if !existing.lines().any(|line| line == rule.trim_end()) {
-            if !existing.is_empty() && !existing.ends_with('\n') {
-                rule.insert(0, '\n');
+    fn is_vault(git_dir: &Path, folder: &Path) -> bool {
+        git_dir.is_dir()
+            && open_repo(git_dir, folder)
+                .and_then(|r| Ok(r.config()?.get_string(MACHINE_KEY)?))
+                .is_ok()
+    }
+
+    /// Moves history kept beside the folder, as the first releases did, into
+    /// it. The history itself is untouched: every ref and commit id stays.
+    fn move_history_inside(&self) -> Result<()> {
+        let old = beside(&self.folder);
+        match fs::rename(&old, &self.git_dir) {
+            Ok(()) => eprintln!(
+                "moved the history from {} into {}",
+                old.display(),
+                self.git_dir.display()
+            ),
+            // Another vaultsync moved it first.
+            Err(_) if self.git_dir.is_dir() => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("moving {} into the folder", old.display()));
             }
-            fs::create_dir_all(attributes.parent().expect("has a parent"))?;
-            fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&attributes)?
-                .write_all(rule.as_bytes())?;
         }
         Ok(())
+    }
+
+    /// What every vault's history holds to: concurrent member additions merge
+    /// as a union, never as markers, and the history is never one of the
+    /// vault's files.
+    fn ensure_rules(&self) -> Result<()> {
+        let info = self.git_dir.join("info");
+        ensure_line(
+            &info.join("attributes"),
+            &format!("{MEMBERS_PATH} merge=union"),
+        )?;
+        ensure_line(&info.join("exclude"), &format!("/{HISTORY}/"))
     }
 
     fn machine(&self) -> Result<String> {
@@ -377,9 +451,9 @@ impl Vault {
     }
 
     /// An empty vault for a machine about to join: no commits yet. Refuses a
-    /// folder that already has files or history beside it.
+    /// folder that already has files, or history beside it from a first release.
     pub fn for_join(folder: &Path, machine: Option<String>) -> Result<(Vault, bool)> {
-        // Resolve `.` and symlinks first, so the history beside the folder is
+        // Resolve `.` and symlinks first, so any history beside the folder is
         // checked where it really is.
         let folder = std::path::absolute(folder)?;
         let (Some(parent), Some(name)) = (folder.parent(), folder.file_name()) else {
@@ -395,7 +469,7 @@ impl Vault {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
             Err(e) => return Err(e).with_context(|| format!("can't read {}", folder.display())),
         };
-        if has_files || git_dir_for(&folder).exists() {
+        if has_files || beside(&folder).exists() {
             bail!(
                 "{} already has files or history; join into an empty or new folder (--folder)",
                 folder.display()
@@ -408,7 +482,7 @@ impl Vault {
         let machine =
             machine.unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned());
         repo.config()?.set_str(MACHINE_KEY, &machine)?;
-        vault.ensure_union_merge()?;
+        vault.ensure_rules()?;
         Ok((vault, created))
     }
 
@@ -416,6 +490,9 @@ impl Vault {
     pub fn adopt(&self, pack: &Path) -> Result<()> {
         let tip = self.import(pack)?;
         let repo = self.repo()?;
+        if writes_into_history(&repo.find_commit(tip)?.tree()?) {
+            bail!("the vault's history would write into its {HISTORY} folder");
+        }
         // HEAD has no commit yet, so every file is new to the checkout, and
         // one someone saved there during the join stops it before it writes.
         repo.checkout_tree(
@@ -430,7 +507,7 @@ impl Vault {
     /// Removes a vault [`for_join`](Self::for_join) made, after a failed join.
     pub fn discard(self, created_folder: bool) -> Result<()> {
         // Only what join wrote: files checked out and still as checked out,
-        // their emptied folders, the history beside, and the folder if join
+        // their emptied folders, the history, and the folder if join
         // made it and nothing else landed there meanwhile.
         let repo = self.repo()?;
         let changed = self.changed_files(&repo)?;
@@ -845,6 +922,9 @@ impl Vault {
         // merge again.
         if !self.changed_files(repo)?.is_empty() {
             return Ok(false);
+        }
+        if writes_into_history(&repo.find_commit(new)?.tree()?) {
+            bail!("commit {new} would write into the vault's {HISTORY} folder");
         }
         let intent = self.state("apply")?;
         write_whole(&intent, &format!("started {old} {new}\n"))?;
