@@ -96,7 +96,6 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
             Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
         }
     }
-    vault.unpin_all()?;
     let net = Net::bind(vault.secret_key()?, opts.addr_dir.as_deref()).await?;
     let (events, mut rx) = mpsc::unbounded_channel();
 
@@ -251,7 +250,7 @@ async fn edited(vault: &Vault, net: &Net, retry: &mut Retry, announced: &mut Opt
 /// Fetches run side by side, so a slow peer holds up neither edits nor other
 /// peers; each result comes back to the event loop, which integrates them one
 /// at a time. One fetch per peer: a request meanwhile runs after it. A running
-/// fetch is never cancelled, since its bundle import can't be.
+/// fetch is never cancelled, since its pack import can't be.
 #[derive(Default)]
 struct Fetches {
     running: HashSet<EndpointId>,

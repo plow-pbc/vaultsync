@@ -1,17 +1,21 @@
-use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use git2::build::CheckoutBuilder;
+use git2::{
+    ErrorCode, Index, IndexAddOption, ObjectType, Oid, Reference, Repository,
+    RepositoryInitOptions, RepositoryOpenFlags, Signature, Status, StatusOptions, Tree,
+};
 use iroh::{EndpointId, SecretKey};
 
-use crate::git::{Git, exec};
 use crate::members::{self, MEMBERS_PATH, Members};
-use crate::merge::merge;
+use crate::merge::{index_entry, merge};
 
 const MACHINE_KEY: &str = "vaultsync.machine";
 /// Tries before giving up on landing a sync over files that keep changing.
@@ -21,7 +25,8 @@ const APPLY_TRIES: usize = 5;
 /// editors and agents never see `.git`.
 #[derive(Clone)]
 pub struct Vault {
-    git: Git,
+    git_dir: PathBuf,
+    folder: PathBuf,
 }
 
 fn git_dir_for(folder: &Path) -> PathBuf {
@@ -35,23 +40,92 @@ fn peer_ref(peer: &EndpointId) -> String {
     format!("refs/vaultsync/peers/{peer}")
 }
 
+/// The repository at `git_dir`, with `work_tree` as its files. Nothing in the
+/// environment (`GIT_DIR` and the like) can point it elsewhere.
+pub fn open_repo(git_dir: &Path, work_tree: &Path) -> Result<Repository> {
+    let repo = Repository::open_ext(
+        git_dir,
+        RepositoryOpenFlags::NO_SEARCH | RepositoryOpenFlags::BARE,
+        std::iter::empty::<&std::ffi::OsStr>(),
+    )
+    .with_context(|| format!("opening {}", git_dir.display()))?;
+    repo.set_workdir(work_tree, false)?;
+    Ok(repo)
+}
+
+/// An empty repository on branch `main`, its files kept elsewhere.
+fn create_repo(git_dir: &Path) -> Result<Repository> {
+    let repo = Repository::init_opts(
+        git_dir,
+        RepositoryInitOptions::new().bare(true).initial_head("main"),
+    )?;
+    repo.config()?.set_bool("core.bare", false)?;
+    Ok(repo)
+}
+
+/// The commit `rev` names: an id, a short id, `HEAD~1`, a branch or a tag.
+pub fn commit_id(repo: &Repository, rev: &str) -> Result<Oid> {
+    Ok(repo
+        .revparse_single(rev)
+        .with_context(|| format!("no commit {rev}"))?
+        .peel_to_commit()?
+        .id())
+}
+
+/// An id as short as it can be while staying unambiguous (7 characters or more).
+pub fn short(repo: &Repository, id: Oid) -> Result<String> {
+    let short = repo.find_object(id, None)?.short_id()?;
+    Ok(short.as_str().context("short id")?.to_owned())
+}
+
+/// The branch HEAD is on.
+fn branch(repo: &Repository) -> Result<String> {
+    let head = repo.find_reference("HEAD")?;
+    Ok(head
+        .symbolic_target()?
+        .context("HEAD is not on a branch")?
+        .to_owned())
+}
+
+/// Points HEAD's branch at `new`, only if it is still at `old` (or, for a
+/// first commit, doesn't exist yet).
+fn move_head(repo: &Repository, new: Oid, old: Option<Oid>) -> Result<Reference<'_>> {
+    let name = branch(repo)?;
+    Ok(match old {
+        Some(old) => repo.reference_matching(&name, new, true, old, "vaultsync")?,
+        None => repo.reference(&name, new, false, "vaultsync")?,
+    })
+}
+
+/// The entry `path` names in `tree`, as (id, mode), if there is one.
+fn entry_at(tree: &Tree, path: &Path) -> Option<(Oid, i32)> {
+    tree.get_path(path).ok().map(|e| (e.id(), e.filemode()))
+}
+
+/// Whether `bytes` look binary the way git judges it: a NUL early on.
+pub fn is_binary(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(8000)].contains(&0)
+}
+
 impl Vault {
     fn at(folder: PathBuf) -> Vault {
         Vault {
-            git: Git {
-                git_dir: git_dir_for(&folder),
-                work_tree: folder,
-            },
+            git_dir: git_dir_for(&folder),
+            folder,
         }
     }
 
     pub fn folder(&self) -> &Path {
-        &self.git.work_tree
+        &self.folder
+    }
+
+    pub fn repo(&self) -> Result<Repository> {
+        open_repo(&self.git_dir, &self.folder)
     }
 
     /// This tool's own files inside the git directory.
     fn state(&self, name: &str) -> Result<PathBuf> {
-        let dir = self.git.git_dir.join("vaultsync");
+        let dir = self.git_dir.join("vaultsync");
         fs::create_dir_all(&dir)?;
         Ok(dir.join(name))
     }
@@ -70,14 +144,10 @@ impl Vault {
             return Err(e);
         }
         let inner = vault.folder().join(".git");
-        let beside = &vault.git.git_dir;
+        let beside = &vault.git_dir;
         // Check existing history before moving anything.
         for git_dir in [&inner, beside].into_iter().filter(|d| d.is_dir()) {
-            let git = Git {
-                git_dir: git_dir.clone(),
-                work_tree: vault.folder().to_owned(),
-            };
-            git.run(["symbolic-ref", "-q", "HEAD"])
+            branch(&open_repo(git_dir, vault.folder())?)
                 .with_context(|| format!("HEAD in {} must be on a branch", git_dir.display()))?;
         }
         match (fs::symlink_metadata(&inner).ok(), beside.exists()) {
@@ -90,24 +160,23 @@ impl Vault {
                 beside.display()
             ),
             (None, true) => {}
-            (None, false) => {
-                vault.git.run(["init", "-q", "-b", "main"])?;
-            }
+            (None, false) => drop(create_repo(beside)?),
         }
-        let fresh = vault.head().is_err();
+        let repo = vault.repo()?;
+        let fresh = repo.head().is_err();
         // A bare snapshot has no index; build it from HEAD without touching refs.
         if !fresh && !beside.join("index").exists() {
-            vault.git.run(["read-tree", "HEAD"])?;
+            let mut index = repo.index()?;
+            index.read_tree(&repo.head()?.peel_to_tree()?)?;
+            index.write()?;
         }
-        let machine = match machine {
-            Some(m) => m,
-            None => gethostname::gethostname().to_string_lossy().into_owned(),
-        };
-        vault.git.run(["config", MACHINE_KEY, &machine])?;
+        let machine =
+            machine.unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned());
+        repo.config()?.set_str(MACHINE_KEY, &machine)?;
         vault.ensure_union_merge()?;
         if fresh {
-            vault.git.run(["add", "-A"])?;
-            vault.commit("Initialize vault")?;
+            vault.stage_all(&repo)?;
+            vault.commit(&repo, "Initialize vault")?;
         }
         Ok(vault)
     }
@@ -117,7 +186,7 @@ impl Vault {
         let start = start.canonicalize()?;
         for dir in start.ancestors() {
             let vault = Vault::at(dir.to_owned());
-            if vault.git.git_dir.is_dir() && vault.machine().is_ok() {
+            if vault.git_dir.is_dir() && vault.machine().is_ok() {
                 vault.ensure_union_merge()?;
                 return Ok(vault);
             }
@@ -127,7 +196,7 @@ impl Vault {
 
     /// Concurrent member additions merge as a union, never as markers.
     fn ensure_union_merge(&self) -> Result<()> {
-        let attributes = self.git.git_dir.join("info").join("attributes");
+        let attributes = self.git_dir.join("info").join("attributes");
         let existing = fs::read_to_string(&attributes).unwrap_or_default();
         let mut rule = format!("{MEMBERS_PATH} merge=union\n");
         if !existing.lines().any(|line| line == rule.trim_end()) {
@@ -145,17 +214,20 @@ impl Vault {
     }
 
     fn machine(&self) -> Result<String> {
-        self.git.value(["config", MACHINE_KEY])
+        Ok(self.repo()?.config()?.get_string(MACHINE_KEY)?)
     }
 
     /// The full id of a commit.
     pub fn resolve(&self, rev: &str) -> Result<String> {
-        self.git
-            .value(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])
+        Ok(commit_id(&self.repo()?, rev)?.to_string())
     }
 
     pub fn head(&self) -> Result<String> {
-        self.git.value(["rev-parse", "--verify", "-q", "HEAD"])
+        Ok(self.head_id(&self.repo()?)?.to_string())
+    }
+
+    fn head_id(&self, repo: &Repository) -> Result<Oid> {
+        repo.head()?.target().context("HEAD points nowhere")
     }
 
     /// This machine's node key, created on first use and never printed.
@@ -186,7 +258,7 @@ impl Vault {
 
     /// The machines trusted as of `rev`, plus this one.
     pub fn members_at(&self, rev: &str) -> Result<Members> {
-        let mut members = members::at(&self.git, rev)?.unwrap_or_default();
+        let mut members = members::at(&self.repo()?, rev)?.unwrap_or_default();
         members
             .listed
             .entry(self.node_id()?)
@@ -251,8 +323,9 @@ impl Vault {
         edit(&mut members)?;
         let path = self.folder().join(MEMBERS_PATH);
         let text = members::format(&members);
+        let repo = self.repo()?;
         if fs::read_to_string(&path).ok().as_deref() == Some(text.as_str()) {
-            return self.git.value(["rev-parse", "--short", "HEAD"]);
+            return short(&repo, self.head_id(&repo)?);
         }
         let dir = path.parent().expect("has a parent");
         // Never write through a symlink a synced commit put there.
@@ -266,8 +339,10 @@ impl Vault {
         }
         fs::create_dir_all(dir)?;
         fs::write(&path, text)?;
-        self.git.run(["add", MEMBERS_PATH])?;
-        self.commit(subject)
+        let mut index = repo.index()?;
+        index.add_path(Path::new(MEMBERS_PATH))?;
+        index.write()?;
+        self.commit(&repo, subject)
     }
 
     /// Records a one-time invite valid for `ttl` and returns its secret. Only
@@ -329,29 +404,26 @@ impl Vault {
         let created = !folder.exists();
         fs::create_dir_all(&folder)?;
         let vault = Vault::at(folder);
-        vault.git.run(["init", "-q", "-b", "main"])?;
-        let machine = match machine {
-            Some(m) => m,
-            None => gethostname::gethostname().to_string_lossy().into_owned(),
-        };
-        vault.git.run(["config", MACHINE_KEY, &machine])?;
+        let repo = create_repo(&vault.git_dir)?;
+        let machine =
+            machine.unwrap_or_else(|| gethostname::gethostname().to_string_lossy().into_owned());
+        repo.config()?.set_str(MACHINE_KEY, &machine)?;
         vault.ensure_union_merge()?;
         Ok((vault, created))
     }
 
-    /// Takes the inviter's full history from its bundle and fills the folder.
-    pub fn adopt(&self, bundle: &Path) -> Result<()> {
-        let mut cmd =
-            self.git
-                .command(["fetch", "-q", "--update-head-ok", "--no-write-fetch-head"]);
-        cmd.arg(bundle)
-            .arg(format!("+{}:refs/heads/main", self.bundle_ref(bundle)?));
-        exec(cmd)?;
-        fs::remove_file(bundle)?;
-        // Refuses to overwrite a file someone saved there during the join.
-        self.git
-            .run(["read-tree", "-m", "-u", "HEAD"])
-            .context("files appeared in the folder during the join")?;
+    /// Takes the inviter's full history from its pack and fills the folder.
+    pub fn adopt(&self, pack: &Path) -> Result<()> {
+        let tip = self.import(pack)?;
+        let repo = self.repo()?;
+        // HEAD has no commit yet, so every file is new to the checkout, and
+        // one someone saved there during the join stops it before it writes.
+        repo.checkout_tree(
+            repo.find_commit(tip)?.as_object(),
+            Some(CheckoutBuilder::new().safe()),
+        )
+        .context("files appeared in the folder during the join")?;
+        move_head(&repo, tip, None)?;
         Ok(())
     }
 
@@ -360,16 +432,14 @@ impl Vault {
         // Only what join wrote: files checked out and still as checked out,
         // their emptied folders, the history beside, and the folder if join
         // made it and nothing else landed there meanwhile.
-        let listed = self.git.run(["ls-files", "-z"]).unwrap_or_default();
-        let changed = self
-            .git
-            .run(["ls-files", "-z", "--modified"])
-            .unwrap_or_default();
-        let changed: Vec<&str> = changed.split('\0').collect();
-        for path in listed
-            .split('\0')
-            .filter(|p| !p.is_empty() && !changed.contains(p))
-        {
+        let repo = self.repo()?;
+        let changed = self.changed_files(&repo)?;
+        let index = repo.index()?;
+        for entry in index.iter() {
+            let path = String::from_utf8_lossy(&entry.path).into_owned();
+            if changed.contains(&path) {
+                continue;
+            }
             let file = self.folder().join(path);
             if fs::remove_file(&file).is_ok() {
                 for dir in file.ancestors().skip(1).take_while(|d| *d != self.folder()) {
@@ -379,11 +449,24 @@ impl Vault {
                 }
             }
         }
-        fs::remove_dir_all(&self.git.git_dir)?;
+        fs::remove_dir_all(&self.git_dir)?;
         if created_folder {
             let _ = fs::remove_dir(self.folder());
         }
         Ok(())
+    }
+
+    /// Tracked files whose contents on disk differ from the index.
+    fn changed_files(&self, repo: &Repository) -> Result<Vec<String>> {
+        let mut opts = StatusOptions::new();
+        opts.include_untracked(false).include_ignored(false);
+        let changed = Status::WT_MODIFIED | Status::WT_DELETED | Status::WT_TYPECHANGE;
+        Ok(repo
+            .statuses(Some(&mut opts))?
+            .iter()
+            .filter(|s| s.status().intersects(changed))
+            .map(|s| String::from_utf8_lossy(s.path_bytes()).into_owned())
+            .collect())
     }
 
     pub fn machine_name(&self) -> Result<String> {
@@ -393,38 +476,58 @@ impl Vault {
     /// Serializes everything that writes to the index, the work tree or HEAD,
     /// and finishes a sync that a crash interrupted.
     fn lock(&self) -> Result<File> {
-        let file = File::create(self.git.git_dir.join("vaultsync.lock"))?;
+        let file = File::create(self.git_dir.join("vaultsync.lock"))?;
         file.lock()?;
         self.recover()?;
         Ok(file)
     }
 
-    /// Commits the staged changes as this machine, signed with its node key,
-    /// plus the writing agent when `VAULTSYNC_AGENT` names one.
-    fn commit(&self, subject: &str) -> Result<String> {
+    /// Commits the index as this machine, signed with its node key, plus the
+    /// writing agent when `VAULTSYNC_AGENT` names one.
+    fn commit(&self, repo: &Repository, subject: &str) -> Result<String> {
         let machine = self.machine()?;
-        let email = format!("vaultsync@{machine}");
-        let tree = self.git.value(["write-tree"])?;
-        let parent = self.head().ok();
-        let parents: Vec<&str> = parent.iter().map(String::as_str).collect();
+        let tree = repo.find_tree(repo.index()?.write_tree()?)?;
+        let parent = repo.head().ok().and_then(|h| h.target());
+        let parents: Vec<String> = parent.iter().map(Oid::to_string).collect();
+        let parents: Vec<&str> = parents.iter().map(String::as_str).collect();
         let mut message = format!("{subject}\n\n");
         if let Ok(agent) = std::env::var("VAULTSYNC_AGENT") {
             message.push_str(&format!("Agent: {agent}\n"));
         }
-        message.push_str(&members::sign(&self.secret_key()?, &tree, &parents));
-        let mut cmd = self.git.command(["commit-tree", &tree, "-m", &message]);
-        for p in &parents {
-            cmd.args(["-p", p]);
+        message.push_str(&members::sign(
+            &self.secret_key()?,
+            &tree.id().to_string(),
+            &parents,
+        ));
+        message.push('\n');
+        let who = Signature::now(&machine, &format!("vaultsync@{machine}"))?;
+        let parent_commits = parent.map(|p| repo.find_commit(p)).transpose()?;
+        let id = repo.commit(
+            None,
+            &who,
+            &who,
+            &message,
+            &tree,
+            &parent_commits.iter().collect::<Vec<_>>(),
+        )?;
+        move_head(repo, id, parent)?;
+        short(repo, id)
+    }
+
+    /// `git add -A`: the index takes every change in the folder, ignored
+    /// files aside. Written only when that changed it: a process stopped
+    /// mid-write leaves the index locked.
+    fn stage_all(&self, repo: &Repository) -> Result<Index> {
+        let mut index = repo.index()?;
+        let entries =
+            |index: &Index| -> Vec<_> { index.iter().map(|e| (e.path, e.id, e.mode)).collect() };
+        let before = entries(&index);
+        index.add_all(["*"], IndexAddOption::DEFAULT, None)?;
+        index.update_all(["*"], None)?;
+        if entries(&index) != before {
+            index.write()?;
         }
-        for (key, value) in [("NAME", &machine), ("EMAIL", &email)] {
-            cmd.env(format!("GIT_AUTHOR_{key}"), value)
-                .env(format!("GIT_COMMITTER_{key}"), value);
-        }
-        let id = exec(cmd)?.trim_end().to_owned();
-        let mut update = vec!["update-ref", "HEAD", &id];
-        update.extend(parents.first().copied());
-        self.git.run(update)?;
-        self.git.value(["rev-parse", "--short", &id])
+        Ok(index)
     }
 
     /// Commits every change in the folder, if there is any.
@@ -434,39 +537,34 @@ impl Vault {
     }
 
     fn commit_pending_locked(&self) -> Result<Option<String>> {
-        self.git.run(["add", "-A"])?;
-        let staged = self.git.run(["diff", "--cached", "--name-only", "-z"])?;
-        let files: Vec<&str> = staged.split('\0').filter(|f| !f.is_empty()).collect();
+        let repo = self.repo()?;
+        let index = self.stage_all(&repo)?;
+        let head = repo.head().ok().map(|h| h.peel_to_tree()).transpose()?;
+        let diff = repo.diff_tree_to_index(head.as_ref(), Some(&index), None)?;
+        let files: Vec<String> = diff
+            .deltas()
+            .filter_map(|d| d.new_file().path().or(d.old_file().path()))
+            .map(|p| p.display().to_string())
+            .collect();
         let subject = match files.as_slice() {
             [] => return Ok(None),
             [one] => format!("Update {one}"),
             many => format!("Update {} files", many.len()),
         };
-        self.commit(&subject).map(Some)
+        self.commit(&repo, &subject).map(Some)
     }
 
     /// How many paths have changes not yet committed.
     pub fn pending(&self) -> Result<usize> {
-        let pending = self.git.run(["status", "--porcelain", "-z"])?;
-        Ok(pending.split('\0').filter(|e| !e.is_empty()).count())
+        let mut opts = StatusOptions::new();
+        opts.include_untracked(true).include_ignored(false);
+        Ok(self.repo()?.statuses(Some(&mut opts))?.len())
     }
 
-    /// Files a merge left for a person: text with git's conflict markers, and
-    /// the `*.conflict-<id>.*` copies kept beside binary files.
+    /// Files a merge left for a person: text with conflict markers, and the
+    /// `*.conflict-<id>.*` copies kept beside binary files.
     pub fn conflicts(&self) -> Result<Vec<String>> {
-        let out = self
-            .git
-            .command(["grep", "-l", "-I", "-E", "^<{7} [0-9a-f]{12}"])
-            .output()?;
-        // 1 means no match.
-        if !out.status.success() && out.status.code() != Some(1) {
-            anyhow::bail!("git grep failed: {}", String::from_utf8_lossy(&out.stderr));
-        }
-        let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::to_owned)
-            .collect();
-        // Pathspecs are literal here, so the copies are picked out by name.
+        let repo = self.repo()?;
         let is_copy = |f: &str| {
             f.rsplit('/')
                 .next()
@@ -479,13 +577,20 @@ impl Vault {
                         .is_some_and(|id| id.iter().all(u8::is_ascii_hexdigit))
                 })
         };
-        let tracked = self.git.run(["ls-files", "-z"])?;
-        files.extend(
-            tracked
-                .split('\0')
-                .filter(|f| is_copy(f))
-                .map(str::to_owned),
-        );
+        // A merge's marker: seven `<`, a space, and a commit's 12-digit id.
+        let marked = |line: &[u8]| {
+            line.strip_prefix(b"<<<<<<< ")
+                .and_then(|rest| rest.get(..12))
+                .is_some_and(|id| id.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')))
+        };
+        let mut files = vec![];
+        for entry in repo.index()?.iter() {
+            let path = String::from_utf8_lossy(&entry.path).into_owned();
+            let text = fs::read(self.folder().join(&path)).unwrap_or_default();
+            if is_copy(&path) || (!is_binary(&text) && text.split(|b| *b == b'\n').any(marked)) {
+                files.push(path);
+            }
+        }
         files.sort();
         Ok(files)
     }
@@ -502,231 +607,199 @@ impl Vault {
 
     pub fn status(&self) -> Result<String> {
         let count = self.pending()?;
+        let repo = self.repo()?;
+        let head = repo.head()?.peel_to_commit()?;
         Ok(format!(
-            "vault:   {}\nhistory: {}\nmachine: {}\nnode:    {}\nbranch:  {}\nhead:    {}\n{count} uncommitted change{}\n",
+            "vault:   {}\nhistory: {}\nmachine: {}\nnode:    {}\nbranch:  {}\nhead:    {} {}\n{count} uncommitted change{}\n",
             self.folder().display(),
-            self.git.git_dir.display(),
+            self.git_dir.display(),
             self.machine()?,
             self.node_id()?,
-            self.git.value(["symbolic-ref", "--short", "HEAD"])?,
-            self.git.value(["log", "-1", "--format=%h %s"])?,
+            branch(&repo)?.trim_start_matches("refs/heads/"),
+            short(&repo, head.id())?,
+            String::from_utf8_lossy(head.summary_bytes().unwrap_or_default()),
             if count == 1 { "" } else { "s" },
         ))
     }
 
+    /// Commits newest first, each as `<id>  <date>  <machine>  <subject>`.
+    /// With `path`, only those that changed it.
     pub fn log(&self, limit: usize, path: Option<&Path>) -> Result<String> {
-        let mut args = vec![
-            "log".into(),
-            format!("-n{limit}"),
-            "--date=format:%Y-%m-%d %H:%M:%S".into(),
-            "--format=%h  %ad  %an  %s".into(),
-        ];
-        if let Some(path) = path {
-            args.extend(["--".into(), path.display().to_string()]);
+        let repo = self.repo()?;
+        let mut walk = repo.revwalk()?;
+        walk.push_head()?;
+        let mut out = String::new();
+        let mut shown = 0;
+        for id in walk {
+            if shown == limit {
+                break;
+            }
+            let commit = repo.find_commit(id?)?;
+            if let Some(path) = path {
+                let here = entry_at(&commit.tree()?, path);
+                let mut parents = commit.parents();
+                let changed = match parents.len() {
+                    0 => here.is_some(),
+                    _ => parents.all(|p| p.tree().is_ok_and(|t| entry_at(&t, path) != here)),
+                };
+                if !changed {
+                    continue;
+                }
+            }
+            let when = commit.time();
+            out.push_str(&format!(
+                "{}  {}  {}  {}\n",
+                short(&repo, commit.id())?,
+                chrono::DateTime::from_timestamp(
+                    when.seconds() + i64::from(when.offset_minutes()) * 60,
+                    0
+                )
+                .context("a commit time out of range")?
+                .format("%Y-%m-%d %H:%M:%S"),
+                String::from_utf8_lossy(commit.author().name_bytes()),
+                String::from_utf8_lossy(commit.summary_bytes().unwrap_or_default()),
+            ));
+            shown += 1;
         }
-        self.git.run(args)
+        Ok(out)
     }
 
-    /// Restores the whole vault, or one path, to its state at `rev` as a new
-    /// commit. Pending edits are committed first, so nothing is lost.
+    /// Restores the whole vault, or some paths, to their state at `rev` as a
+    /// new commit. Pending edits are committed first, so nothing is lost.
     pub fn rollback(&self, rev: &str, paths: &[PathBuf]) -> Result<String> {
         let _lock = self.lock()?;
         // Resolve first: the checkpoint below moves HEAD, and with it `HEAD~1`.
-        let id = self
-            .git
-            .value(["rev-parse", "--verify", &format!("{rev}^{{commit}}")])?;
-        let short = self.git.value(["rev-parse", "--short", &id])?;
+        let (id, short_id) = {
+            let repo = self.repo()?;
+            let id = commit_id(&repo, rev)?;
+            (id, short(&repo, id)?)
+        };
         self.commit_pending_locked()?;
+        let repo = self.repo()?;
+        let head = repo.head()?.peel_to_commit()?;
+        let then = repo.find_commit(id)?.tree()?;
+        let now = head.tree()?;
         let (mut tree, what) = if paths.is_empty() {
-            (
-                self.git.value(["rev-parse", &format!("{id}^{{tree}}")])?,
-                "vault".to_owned(),
-            )
+            (then.id(), "vault".to_owned())
         } else {
             let names: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-            (self.tree_with("HEAD", &id, paths)?, names.join(", "))
+            // `a/./b` is `a/b`, and `.` the whole vault.
+            let paths: Vec<PathBuf> = paths
+                .iter()
+                .map(|p| p.components().filter(|c| *c != Component::CurDir).collect())
+                .collect();
+            if let Some(p) = paths.iter().find(|p| {
+                !p.as_os_str().is_empty()
+                    && entry_at(&then, p).is_none()
+                    && entry_at(&now, p).is_none()
+            }) {
+                bail!("{} is in neither {short_id} nor the vault now", p.display());
+            }
+            (tree_with(&repo, &now, &then, &paths)?, names.join(", "))
         };
         // A rollback never undoes a membership change, whatever it selects:
         // the member list stays as it is now.
         let members = Path::new(MEMBERS_PATH);
-        if self.has(&tree, members) || self.has("HEAD", members) {
-            tree = self.tree_with(&tree, "HEAD", &[members.to_owned()])?;
+        let target = repo.find_tree(tree)?;
+        if entry_at(&target, members) != entry_at(&now, members) {
+            tree = tree_with(&repo, &target, &now, &[members.to_owned()])?;
         }
-        // Git overwrites ignored files freely; refuse instead.
-        let added = self.git.run([
-            "diff",
-            "--name-only",
-            "-z",
-            "--no-renames",
-            "--diff-filter=A",
-            "HEAD",
-            &tree,
-        ])?;
-        let ignored = self.git.run([
-            "ls-files",
-            "-z",
-            "--others",
-            "--ignored",
-            "--exclude-standard",
-        ])?;
-        let ignored: Vec<&str> = ignored.split('\0').filter(|f| !f.is_empty()).collect();
-        // The same path, or one inside the other (a file where a folder was).
-        let overlaps = |a: &str, b: &str| {
-            a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
-        };
-        let clash: Vec<&str> = added
-            .split('\0')
-            .filter(|f| !f.is_empty() && ignored.iter().any(|i| overlaps(f, i)))
-            .collect();
-        if !clash.is_empty() {
-            bail!(
-                "rollback would overwrite untracked files: {}; move them aside",
-                clash.join(", ")
-            );
+        if tree == now.id() {
+            bail!("{what} already matches {short_id}");
         }
-        // One checked update for both modes: it refuses to overwrite a file
-        // saved since the checkpoint.
-        self.git
-            .run(["read-tree", "-m", "-u", "HEAD", &tree])
-            .context("files changed during rollback; try again")?;
-        if self
-            .git
-            .run(["diff", "--cached", "--name-only"])?
-            .is_empty()
-        {
-            bail!("{what} already matches {short}");
-        }
-        self.commit(&format!("Roll back {what} to {short}"))
-    }
-
-    /// HEAD's tree with `path` as it was at `id` (absent if it was absent),
-    /// built in a scratch index so the real one is untouched.
-    fn has(&self, rev: &str, path: &Path) -> bool {
-        self.git
-            .run(["cat-file", "-e", &format!("{rev}:{}", path.display())])
-            .is_ok()
-    }
-
-    /// `base`'s tree with `paths` as they are at `id`.
-    fn tree_with(&self, base: &str, id: &str, paths: &[PathBuf]) -> Result<String> {
-        let index = self.git.git_dir.join("vaultsync-rollback-index");
-        let with_index = |args: &[&OsStr]| {
-            let mut cmd = self.git.command(args);
-            cmd.env("GIT_INDEX_FILE", &index);
-            exec(cmd)
-        };
-        let source = format!("--source={id}");
-        with_index(&["read-tree".as_ref(), base.as_ref()])?;
-        let mut restore: Vec<&OsStr> = vec![
-            "restore".as_ref(),
-            "--staged".as_ref(),
-            source.as_ref(),
-            "--".as_ref(),
-        ];
-        restore.extend(paths.iter().map(|p| p.as_os_str()));
-        with_index(&restore)?;
-        let tree = with_index(&["write-tree".as_ref()])?;
-        fs::remove_file(&index)?;
-        Ok(tree.trim_end().to_owned())
+        // Refuses, before writing anything, to overwrite a file saved since
+        // the checkpoint or an ignored one in the way.
+        repo.checkout_tree(
+            repo.find_tree(tree)?.as_object(),
+            Some(CheckoutBuilder::new().safe().overwrite_ignored(false)),
+        )
+        .context("rollback would overwrite files changed since, or not tracked; move them aside")?;
+        self.commit(&repo, &format!("Roll back {what} to {short_id}"))
     }
 
     /// Commit ids to tell a peer this machine already has.
     pub fn haves(&self) -> Result<Vec<String>> {
-        let refs = self.git.run([
-            "for-each-ref",
-            "--format=%(objectname)",
-            "refs/vaultsync/peers",
-        ])?;
-        let head = self.head()?;
-        Ok(refs.lines().map(str::to_owned).chain([head]).collect())
+        let repo = self.repo()?;
+        let mut haves = vec![];
+        for r in repo.references_glob("refs/vaultsync/peers/*")? {
+            haves.extend(r?.target().map(|id| id.to_string()));
+        }
+        haves.push(self.head_id(&repo)?.to_string());
+        Ok(haves)
     }
 
     /// The subset of `ids` that are commits here.
     pub fn present(&self, ids: &[String]) -> Result<Vec<String>> {
-        let query: String = ids.iter().map(|id| format!("{id}^{{commit}}\n")).collect();
-        let answers = self
-            .git
-            .run_stdin(["cat-file", "--batch-check=%(objectname)"], &query)?;
+        let repo = self.repo()?;
         Ok(ids
             .iter()
-            .zip(answers.lines())
-            .filter(|(_, a)| !a.ends_with(" missing"))
-            .map(|(id, _)| id.clone())
+            .filter(|id| Oid::from_str(id).is_ok_and(|oid| repo.find_commit(oid).is_ok()))
+            .cloned()
             .collect())
     }
 
-    /// Whether HEAD has commits that `haves` lack.
+    /// Whether `head` has commits that `haves` lack.
     pub fn has_news(&self, head: &str, haves: &[String]) -> Result<bool> {
-        let mut args = vec!["rev-list", "-n1", head, "--not"];
-        args.extend(haves.iter().map(String::as_str));
-        Ok(!self.git.run(args)?.is_empty())
+        let repo = self.repo()?;
+        Ok(walk_new(&repo, head, haves)?.next().is_some())
     }
 
-    /// `git bundle create - HEAD --not <haves>`, for streaming to a peer.
-    pub fn bundle_command(&self, pinned: &str, haves: &[String]) -> std::process::Command {
-        let mut cmd = self.git.command(["bundle", "create", "-q", "-", pinned]);
-        if !haves.is_empty() {
-            cmd.arg("--not").args(haves);
-        }
-        cmd
+    /// `head` and a pack of everything it holds that `haves` lack: the id on
+    /// its own line, then the pack.
+    pub fn pack(&self, head: &str, haves: &[String]) -> Result<Vec<u8>> {
+        let repo = self.repo()?;
+        let mut walk = walk_new(&repo, head, haves)?;
+        let mut builder = repo.packbuilder()?;
+        builder.insert_walk(&mut walk)?;
+        let mut pack = git2::Buf::new();
+        builder.write_buf(&mut pack)?;
+        let mut out = format!("{head}\n").into_bytes();
+        out.extend_from_slice(&pack);
+        Ok(out)
     }
 
-    /// Names `commit` with a ref of its own, so a bundle carries exactly that
-    /// commit however HEAD moves meanwhile. Drop it with [`unpin`](Self::unpin).
-    pub fn pin(&self, commit: &str) -> Result<String> {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let name = format!("refs/vaultsync/serving/{}-{n}", std::process::id());
-        self.git.run(["update-ref", &name, commit])?;
-        Ok(name)
-    }
-
-    pub fn unpin(&self, name: &str) -> Result<()> {
-        self.git.run(["update-ref", "-d", name]).map(drop)
-    }
-
-    /// Drops pins a crashed or cancelled request left behind.
-    pub fn unpin_all(&self) -> Result<()> {
-        let pins = self.git.run([
-            "for-each-ref",
-            "--format=%(refname)",
-            "refs/vaultsync/serving",
-        ])?;
-        pins.lines().try_for_each(|name| self.unpin(name))
-    }
-
-    /// The one ref a peer's bundle carries.
-    fn bundle_ref(&self, bundle: &Path) -> Result<String> {
-        let mut cmd = self.git.command(["bundle", "list-heads"]);
-        cmd.arg(bundle);
-        let heads = exec(cmd)?;
-        let line = heads.lines().next().context("empty bundle")?;
-        let (_, name) = line.split_once(' ').context("malformed bundle")?;
-        Ok(name.to_owned())
-    }
-
-    /// Path for a bundle arriving from `peer`.
+    /// Path for a pack arriving from `peer`.
     pub fn incoming(&self, peer: &EndpointId) -> Result<PathBuf> {
         // A fresh name per attempt: no two transfers ever share a file.
         static ATTEMPT: AtomicU64 = AtomicU64::new(0);
         let attempt = ATTEMPT.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
         self.state(&format!(
-            "incoming-{}-{pid}-{attempt}.bundle",
+            "incoming-{}-{pid}-{attempt}.pack",
             peer.fmt_short()
         ))
     }
 
-    /// Stores a peer's head from its bundle.
-    pub fn receive(&self, peer: &EndpointId, bundle: &Path) -> Result<()> {
-        let name = peer_ref(peer);
-        let fetched = self.bundle_ref(bundle).and_then(|r| {
-            let mut cmd = self.git.command(["fetch", "-q", "--no-write-fetch-head"]);
-            cmd.arg(bundle).arg(format!("+{r}:{name}"));
-            exec(cmd)
-        });
-        fs::remove_file(bundle)?;
-        fetched.map(drop)
+    /// Stores the objects of a [`pack`](Self::pack) and returns its head,
+    /// removing the file either way.
+    fn import(&self, path: &Path) -> Result<Oid> {
+        let imported = fs::read(path)
+            .map_err(anyhow::Error::from)
+            .and_then(|bytes| {
+                let split = bytes
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .context("malformed pack")?;
+                let head = Oid::from_str(std::str::from_utf8(&bytes[..split])?)?;
+                let repo = self.repo()?;
+                let odb = repo.odb()?;
+                let mut writer = odb.packwriter()?;
+                writer.write_all(&bytes[split + 1..])?;
+                writer.commit()?;
+                repo.find_commit(head)
+                    .context("the pack lacks its own head")?;
+                Ok(head)
+            });
+        fs::remove_file(path)?;
+        imported
+    }
+
+    /// Stores a peer's head from its pack.
+    pub fn receive(&self, peer: &EndpointId, pack: &Path) -> Result<()> {
+        let tip = self.import(pack)?;
+        self.repo()?
+            .reference(&peer_ref(peer), tip, true, "fetched")?;
+        Ok(())
     }
 
     /// Brings a peer's head into this vault: fast-forward, or a merge. Pending
@@ -734,14 +807,12 @@ impl Vault {
     /// never overwritten. Returns the new HEAD if it moved.
     pub fn integrate(&self, peer: &EndpointId) -> Result<Option<String>> {
         let _lock = self.lock()?;
-        let Ok(tip) = self
-            .git
-            .value(["rev-parse", "-q", "--verify", &peer_ref(peer)])
-        else {
+        let Ok(tip) = self.repo()?.refname_to_id(&peer_ref(peer)) else {
             return Ok(None);
         };
         for _ in 0..APPLY_TRIES {
             self.commit_pending_locked()?;
+            let repo = self.repo()?;
             // History straight from a peer removed meanwhile counts for nothing;
             // what a current member relays is judged commit by commit.
             if !self.members()?.contains(peer) {
@@ -750,76 +821,72 @@ impl Vault {
                     peer.fmt_short()
                 );
             }
-            let head = self.head()?;
-            if self.is_ancestor(&tip, &head) {
+            let head = self.head_id(&repo)?;
+            if tip == head || repo.graph_descendant_of(head, tip)? {
                 return Ok(None);
             }
-            members::validate(&self.git, &head, &tip, &self.members()?)
+            members::validate(&repo, head, tip, &self.members()?)
                 .with_context(|| format!("refusing history from {}", peer.fmt_short()))?;
             // Merge only when each side has edits the other lacks. A head that
             // already holds all of ours is taken as is; merging it again is how
             // a ring of peers would keep re-merging the same edits forever.
-            let ours_covered = self.edits_beyond(&head, &tip)? == 0;
-            let theirs_covered = self.edits_beyond(&tip, &head)? == 0;
+            let ours_covered = edits_beyond(&repo, head, tip)? == 0;
+            let theirs_covered = edits_beyond(&repo, tip, head)? == 0;
             let new = match (ours_covered, theirs_covered) {
                 // Same edits, different merges: the greater id wins everywhere.
                 (true, true) if head > tip => return Ok(None),
-                (true, _) => tip.clone(),
+                (true, _) => tip,
                 // We hold all of theirs and more; they take ours.
                 (false, true) => return Ok(None),
-                (false, false) => merge(&self.git, &head, &tip)?,
+                (false, false) => merge(&repo, head, tip)?,
             };
-            if self.apply(&head, &new)? {
-                return Ok(Some(new));
+            if self.apply(&repo, head, new)? {
+                return Ok(Some(new.to_string()));
             }
         }
         bail!("files kept changing; will retry")
     }
 
-    /// Edits (non-merge commits) reachable from `a` but not from `b`.
-    fn edits_beyond(&self, a: &str, b: &str) -> Result<usize> {
-        Ok(self
-            .git
-            .value(["rev-list", "--no-merges", "--count", a, "--not", b])?
-            .parse()?)
-    }
-
-    fn is_ancestor(&self, a: &str, b: &str) -> bool {
-        self.git.run(["merge-base", "--is-ancestor", a, b]).is_ok()
-    }
-
     /// Moves HEAD, index and work tree from `old` to `new`. False if a file
-    /// git would change was edited meanwhile; nothing is touched then. The
+    /// that would change was edited meanwhile; nothing is touched then. The
     /// intent file records how far it got, for `recover`.
-    fn apply(&self, old: &str, new: &str) -> Result<bool> {
+    fn apply(&self, repo: &Repository, old: Oid, new: Oid) -> Result<bool> {
         if hooked("pause-before-apply") {
             eprintln!("test hook: pausing before apply");
             std::thread::sleep(std::time::Duration::from_secs(3));
         }
-        // git's check below treats a deleted tracked file as clean and would
-        // write it back, so a rename made since the checkpoint would leave
-        // both names. Any tracked change since then: commit it and merge again.
-        if self.git.run(["diff", "--quiet"]).is_err() {
+        // A tracked file deleted since the checkpoint isn't in the checkout's
+        // way and would be written back, so a rename made meanwhile would
+        // leave both names. Any tracked change since then: commit it and
+        // merge again.
+        if !self.changed_files(repo)?.is_empty() {
             return Ok(false);
         }
         let intent = self.state("apply")?;
         write_whole(&intent, &format!("started {old} {new}\n"))?;
         crash_if_hooked("crash-before-worktree");
-        if self.git.run(["read-tree", "-m", "-u", old, new]).is_err() {
-            fs::remove_file(&intent)?;
-            return Ok(false);
+        let checkout = repo.checkout_tree(
+            repo.find_commit(new)?.as_object(),
+            Some(CheckoutBuilder::new().safe()),
+        );
+        match checkout {
+            Err(e) if e.code() == ErrorCode::Conflict => {
+                fs::remove_file(&intent)?;
+                return Ok(false);
+            }
+            checkout => checkout?,
         }
         write_whole(&intent, &format!("written {old} {new}\n"))?;
         crash_if_hooked("crash-after-worktree");
-        self.git.run(["update-ref", "HEAD", new, old])?;
+        move_head(repo, new, Some(old))?;
         fs::remove_file(&intent)?;
         Ok(true)
     }
 
     /// Settles an `apply` a crash interrupted, never undoing what a user did
     /// since. Once the work tree was fully written only HEAD is left to move,
-    /// and any difference from `new` is the user's. Before that, git may have
-    /// written part of `new`: HEAD stays at `old`, and whatever is on disk is
+    /// and any difference from `new` is the user's. Before that, part of `new`
+    /// may be on disk: HEAD stays at `old`, and whatever is on disk is
     /// committed as an edit and merged again.
     fn recover(&self) -> Result<()> {
         let intent = self.state("apply")?;
@@ -829,12 +896,77 @@ impl Vault {
         let [phase, old, new] = text.split_whitespace().collect::<Vec<_>>()[..] else {
             bail!("corrupt apply intent: {text}");
         };
-        if phase == "written" && self.head()? == old {
-            self.git.run(["update-ref", "HEAD", new, old])?;
+        let repo = self.repo()?;
+        let (old, new) = (Oid::from_str(old)?, Oid::from_str(new)?);
+        if phase == "written" && self.head_id(&repo)? == old {
+            move_head(&repo, new, Some(old))?;
         }
         fs::remove_file(&intent)?;
         Ok(())
     }
+}
+
+/// Commits reachable from `head` but not from any of `haves`.
+fn walk_new<'r>(repo: &'r Repository, head: &str, haves: &[String]) -> Result<git2::Revwalk<'r>> {
+    let mut walk = repo.revwalk()?;
+    walk.push(Oid::from_str(head)?)?;
+    for have in haves {
+        walk.hide(Oid::from_str(have)?)?;
+    }
+    Ok(walk)
+}
+
+/// Edits (non-merge commits) reachable from `a` but not from `b`.
+fn edits_beyond(repo: &Repository, a: Oid, b: Oid) -> Result<usize> {
+    let mut walk = repo.revwalk()?;
+    walk.push(a)?;
+    walk.hide(b)?;
+    let mut edits = 0;
+    for id in walk {
+        if repo.find_commit(id?)?.parent_count() <= 1 {
+            edits += 1;
+        }
+    }
+    Ok(edits)
+}
+
+/// `base` with `paths` as they are in `source` (absent where it lacks them).
+fn tree_with(repo: &Repository, base: &Tree, source: &Tree, paths: &[PathBuf]) -> Result<Oid> {
+    let mut index = Index::new()?;
+    index.read_tree(base)?;
+    for path in paths {
+        if path.as_os_str().is_empty() {
+            index.clear()?;
+            index.read_tree(source)?;
+            continue;
+        }
+        index.remove_path(path)?;
+        index.remove_dir(path, 0)?;
+        let Ok(entry) = source.get_path(path) else {
+            continue;
+        };
+        let prefix = path.as_os_str().as_bytes();
+        match entry.kind() {
+            Some(ObjectType::Tree) => {
+                add_files(repo, &mut index, prefix, &repo.find_tree(entry.id())?)?
+            }
+            _ => index.add(&index_entry(prefix, entry.filemode(), entry.id()))?,
+        }
+    }
+    Ok(index.write_tree_to(repo)?)
+}
+
+/// Adds every file under `tree` to `index`, each path under `prefix`, its
+/// name kept byte for byte.
+fn add_files(repo: &Repository, index: &mut Index, prefix: &[u8], tree: &Tree) -> Result<()> {
+    for e in tree.iter() {
+        let path = [prefix, b"/", e.name_bytes()].concat();
+        match e.kind() {
+            Some(ObjectType::Tree) => add_files(repo, index, &path, &repo.find_tree(e.id())?)?,
+            _ => index.add(&index_entry(&path, e.filemode(), e.id()))?,
+        }
+    }
+    Ok(())
 }
 
 /// Replaces `path` by renaming a finished copy over it: a crash leaves the
