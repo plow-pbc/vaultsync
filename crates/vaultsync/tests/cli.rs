@@ -181,6 +181,56 @@ fn failed_auto_commit_is_retried_without_another_edit() {
 }
 
 #[test]
+fn a_second_daemon_on_a_vault_waits_for_the_first_to_stop() {
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("notes");
+    init(&folder);
+    let mut first = start_daemon(&folder, &[], "");
+    let mut first_err = BufReader::new(first.stderr.take().unwrap());
+    let mut line = String::new();
+    while !line.contains("watching") {
+        line.clear();
+        assert_ne!(
+            first_err.read_line(&mut line).unwrap(),
+            0,
+            "first daemon exited"
+        );
+    }
+    let mut second = start_daemon(&folder, &[], "");
+    let mut second_err = BufReader::new(second.stderr.take().unwrap());
+    line.clear();
+    second_err.read_line(&mut line).unwrap();
+    assert!(
+        line.contains("another vaultsync is running this vault"),
+        "{line}"
+    );
+
+    // Once the first stops, the second takes over.
+    first.kill().unwrap();
+    first.wait().unwrap();
+    line.clear();
+    while !line.contains("watching") {
+        line.clear();
+        assert_ne!(
+            second_err.read_line(&mut line).unwrap(),
+            0,
+            "second daemon exited"
+        );
+    }
+    fs::write(folder.join("after.md"), "saved under the second daemon\n").unwrap();
+    let start = Instant::now();
+    while !ok(&folder, &["log", "-n", "1"]).contains("Update after.md") {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "second daemon never committed"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    second.kill().unwrap();
+    second.wait().unwrap();
+}
+
+#[test]
 fn rollback_never_overwrites_a_file_it_does_not_track() {
     // (tracked once, ignored local file that now sits in its place)
     for (old, local) in [("draft.tmp", "draft.tmp"), ("drafts", "drafts/scratch.tmp")] {
