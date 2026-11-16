@@ -422,7 +422,7 @@ fn heads_holding_the_same_edits_settle_without_merging_again() {
 fn vaultsync_merge(node: &Node, a: &str, b: &str) -> String {
     let repo = git2::Repository::open_bare(node.folder.with_extension("git")).unwrap();
     let id = |c: &str| git2::Oid::from_str(c.trim()).unwrap();
-    vaultsync::merge::merge(&repo, id(a), id(b))
+    vaultsync_engine::merge::merge(&repo, id(a), id(b))
         .unwrap()
         .to_string()
 }
@@ -727,7 +727,7 @@ fn legacy_merge(node: &Node, a: &str, b: &str, signer: Option<&iroh::SecretKey>)
     let mut message = "Merge".to_owned();
     if let Some(key) = signer {
         message.push_str("\n\n");
-        message.push_str(&vaultsync::members::sign(key, tree, &[ours, theirs]));
+        message.push_str(&vaultsync_engine::members::sign(key, tree, &[ours, theirs]));
     }
     unsigned_commit(node, tree, &[ours, theirs], &message, true)
 }

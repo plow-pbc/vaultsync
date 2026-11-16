@@ -1,23 +1,15 @@
 [package]
 name = "vaultsync"
-version = "0.3.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-anyhow = "1.0.104"
-blake3 = "1.8"
-clap = { version = "4.6.7", features = ["derive"] }
-data-encoding = "2.11.1"
-gethostname = "1.1.0"
-git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
-iroh = { version = "1", default-features = false, features = ["tls-ring"] }
-noq = "1"
-notify-debouncer-mini = "0.7.0"
-rand = "0.10"
-serde_json = "1.0.154"
-tokio = { version = "1.54.1", features = ["full"] }
+vaultsync-engine = { path = "../engine" }
 
 [dev-dependencies]
+git2 = { version = "0.21", default-features = false }
+iroh = { version = "1", default-features = false, features = ["tls-ring"] }
+serde_json = "1.0.154"
 tempfile = "3.27.0"
