@@ -3459,7 +3459,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vaultsync"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "git2",
  "iroh",
@@ -3470,7 +3470,7 @@ dependencies = [
 
 [[package]]
 name = "vaultsync-engine"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3489,7 +3489,7 @@ dependencies = [
 
 [[package]]
 name = "vaultsync-ffi"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "serde_json",
  "vaultsync-engine",
