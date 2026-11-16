@@ -378,23 +378,17 @@ fn one_service_runs_every_tracked_vault_including_ones_added_later() {
     run(&["init", folder("a").to_str().unwrap(), "--machine", MACHINE]);
     run(&["init", folder("b").to_str().unwrap(), "--machine", MACHINE]);
     run(&["--vault", folder("a").to_str().unwrap(), "track"]);
-    let listed = fs::read_to_string(config.join("vaults")).unwrap();
-    assert_eq!(listed.lines().count(), 2, "{listed}");
-    // A symlink where the list goes is replaced, never written through.
-    let elsewhere = tmp.path().join("someone-elses-settings");
-    fs::write(&elsewhere, "keep\n").unwrap();
-    fs::remove_file(config.join("vaults")).unwrap();
-    std::os::unix::fs::symlink(&elsewhere, config.join("vaults")).unwrap();
-    run(&["--vault", folder("b").to_str().unwrap(), "track"]);
-    assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "keep\n");
-    assert!(!config.join("vaults").is_symlink());
-    let listed = fs::read_to_string(config.join("vaults")).unwrap();
-    assert!(listed.ends_with("/b\n"), "{listed}");
-    fs::write(
-        config.join("vaults"),
-        format!("{}\n{}\n", folder("a").display(), folder("b").display()),
-    )
-    .unwrap();
+    assert_eq!(fs::read_dir(config.join("vaults")).unwrap().count(), 2);
+    // A vault may be neither inside the settings nor around them.
+    for overlapping in [config.join("notes"), tmp.path().to_owned()] {
+        let out = bin()
+            .env("VAULTSYNC_CONFIG_DIR", &config)
+            .args(["init", overlapping.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{}", overlapping.display());
+    }
+    assert!(!config.join("notes").exists());
 
     let mut service = bin()
         .env("VAULTSYNC_CONFIG_DIR", &config)
