@@ -437,9 +437,56 @@ impl Vault {
         self.commit(&subject).map(Some)
     }
 
-    pub fn status(&self) -> Result<String> {
+    /// How many paths have changes not yet committed.
+    pub fn pending(&self) -> Result<usize> {
         let pending = self.git.run(["status", "--porcelain", "-z"])?;
-        let count = pending.split('\0').filter(|e| !e.is_empty()).count();
+        Ok(pending.split('\0').filter(|e| !e.is_empty()).count())
+    }
+
+    /// Files a merge left for a person: text with git's conflict markers, and
+    /// the `*.conflict-<id>.*` copies kept beside binary files.
+    pub fn conflicts(&self) -> Result<Vec<String>> {
+        let out = self
+            .git
+            .command(["grep", "-l", "-I", "-E", "^<{7} [0-9a-f]{12}"])
+            .output()?;
+        // 1 means no match.
+        if !out.status.success() && out.status.code() != Some(1) {
+            anyhow::bail!("git grep failed: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        // Pathspecs are literal here, so the copies are picked out by name.
+        let is_copy = |f: &str| {
+            f.rsplit('/')
+                .next()
+                .unwrap_or(f)
+                .split(".conflict-")
+                .nth(1)
+                .is_some_and(|rest| {
+                    rest.len() >= 8 && rest[..8].bytes().all(|b| b.is_ascii_hexdigit())
+                })
+        };
+        let tracked = self.git.run(["ls-files", "-z"])?;
+        files.extend(
+            tracked
+                .split('\0')
+                .filter(|f| is_copy(f))
+                .map(str::to_owned),
+        );
+        files.sort();
+        Ok(files)
+    }
+
+    /// Where the running daemon keeps what it knows about its peers.
+    pub fn daemon_state(&self) -> Result<PathBuf> {
+        self.state("daemon.json")
+    }
+
+    pub fn status(&self) -> Result<String> {
+        let count = self.pending()?;
         Ok(format!(
             "vault:   {}\nhistory: {}\nmachine: {}\nnode:    {}\nbranch:  {}\nhead:    {}\n{count} uncommitted change{}\n",
             self.folder().display(),

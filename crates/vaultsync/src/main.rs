@@ -1,9 +1,11 @@
+mod config;
 mod daemon;
 mod git;
 mod join;
 mod members;
 mod merge;
 mod net;
+mod status;
 mod vault;
 
 use std::path::PathBuf;
@@ -36,7 +38,17 @@ enum Cmd {
         machine: Option<String>,
     },
     /// Show the vault, this machine, and uncommitted changes.
-    Status,
+    Status {
+        /// As JSON, with peers, last sync and conflicts, for a front end.
+        #[arg(long)]
+        json: bool,
+        /// Every vault the background service runs (with --json).
+        #[arg(long, requires = "json")]
+        all: bool,
+    },
+    /// Have the background service (`run --all`) keep this vault in sync.
+    /// `init` and `join` do this themselves.
+    Track,
     /// Print this machine's node id, which other members add.
     Id,
     /// Change the member list.
@@ -90,6 +102,10 @@ enum Cmd {
         /// notifications (used anyway when those are unavailable).
         #[arg(long)]
         poll: bool,
+        /// Run every vault in ~/.config/vaultsync/vaults, picking up ones
+        /// added later (what the background service runs).
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -111,9 +127,23 @@ fn main() -> Result<()> {
     match cli.command {
         Cmd::Init { folder, machine } => {
             let vault = Vault::init(&folder, machine)?;
+            config::track(vault.folder())?;
             print!("{}", vault.status()?);
         }
-        Cmd::Status => print!("{}", open()?.status()?),
+        Cmd::Status { json: false, .. } => print!("{}", open()?.status()?),
+        Cmd::Status { json: true, all } => {
+            let value = if all {
+                let vaults: Result<Vec<_>> = config::vaults()?
+                    .iter()
+                    .map(|folder| status::json(&Vault::open(folder)?))
+                    .collect();
+                serde_json::Value::from(vaults?)
+            } else {
+                status::json(&open()?)?
+            };
+            println!("{value}");
+        }
+        Cmd::Track => config::track(open()?.folder())?,
         Cmd::Id => println!("{}", open()?.node_id()?),
         Cmd::Member(MemberCmd::Add { id, name }) => {
             println!("committed {}", open()?.add_member(id, &name)?)
@@ -130,6 +160,7 @@ fn main() -> Result<()> {
             addr_dir,
         } => {
             let vault = join::join(&code, folder, machine, addr_dir)?;
+            config::track(vault.folder())?;
             print!("{}", vault.status()?);
             println!(
                 "Joined. Start syncing with: vaultsync --vault {} run",
@@ -145,14 +176,19 @@ fn main() -> Result<()> {
             catch_up,
             addr_dir,
             poll,
-        } => daemon::run(
-            open()?,
-            daemon::Opts {
+            all,
+        } => {
+            let opts = daemon::Opts {
                 catch_up: Duration::from_secs(catch_up),
                 addr_dir,
                 poll,
-            },
-        )?,
+            };
+            if all {
+                daemon::run_all(opts)?
+            } else {
+                daemon::run(open()?, opts)?
+            }
+        }
     }
     Ok(())
 }
