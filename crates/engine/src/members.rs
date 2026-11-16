@@ -183,12 +183,15 @@ pub fn validate(repo: &Repository, head: Oid, tip: Oid, trusted: &Members) -> Re
         }
     }
     let vouched = reachable(repo, &introductions, head)?;
-    // Every signed edit must pass as a member's below, or nothing is
-    // accepted; so what lies beneath one was taken in by a member. A merge's
+    // What lies beneath an edit a current member signed was taken in by that
+    // member. Only the local list counts here: a member list the vouched-for
+    // merge itself could have forged must not authorize its voucher. A merge's
     // signature is never checked, so it vouches for nothing.
     let signed: Vec<Oid> = commits
         .iter()
-        .filter(|(id, parents)| parents.len() <= 1 && signers[id].is_some())
+        .filter(|(id, parents)| {
+            parents.len() <= 1 && signers[id].is_some_and(|s| trusted.contains(&s))
+        })
         .map(|(id, _)| *id)
         .collect();
     let beneath_signed = reachable(repo, &signed, head)?;

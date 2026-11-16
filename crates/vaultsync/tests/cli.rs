@@ -462,3 +462,31 @@ fn a_vault_from_a_first_release_moves_its_history_inside_unchanged() {
     let log = ok(&folder, &["log"]);
     assert!(log.contains("Initialize vault"), "{log}");
 }
+
+/// Linux only: macOS refuses file names that aren't UTF-8.
+#[cfg(target_os = "linux")]
+#[test]
+fn rollback_of_a_folder_keeps_names_that_are_not_utf8() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let folder = tmp.path().join("notes");
+    let names = [b"\xfe.md".as_slice(), b"\xff.md".as_slice()];
+    let file = |name: &[u8]| folder.join("raw").join(std::ffi::OsStr::from_bytes(name));
+    fs::create_dir_all(folder.join("raw")).unwrap();
+    for name in names {
+        fs::write(file(name), "v1\n").unwrap();
+    }
+    init(&folder);
+    let first = ok(&folder, &["log"])
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    fs::remove_dir_all(folder.join("raw")).unwrap();
+
+    ok(&folder, &["rollback", &first, "raw"]);
+
+    for name in names {
+        assert_eq!(fs::read_to_string(file(name)).unwrap(), "v1\n");
+    }
+}
