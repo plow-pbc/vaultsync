@@ -1,5 +1,6 @@
 import AppKit
 
+@MainActor
 enum Actions {
     static func openInObsidian(_ vault: VaultStatus) {
         open(path: vault.folder)
@@ -39,15 +40,17 @@ enum Actions {
         }
     }
 
+    /// Syncs a folder: one already synced elsewhere on this Mac (by the
+    /// command-line tool, say) is taken over as is; any other becomes a new vault.
     static func addFolder(done: @escaping @MainActor () -> Void) {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.canCreateDirectories = true
-        panel.prompt = "Sync this folder"
-        NSApp.activate(ignoringOtherApps: true)
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        inBackground(["init", url.path], failure: "Couldn't add \(url.lastPathComponent)", then: done)
+        guard let url = pickFolder(prompt: "Sync this folder", message: nil) else { return }
+        inBackground(granting: url, failure: "Couldn't add \(url.lastPathComponent)", then: done) {
+            do {
+                try CLI.run(["--vault", url.path, "track"])
+            } catch {
+                try CLI.run(["init", url.path])
+            }
+        }
     }
 
     static func join(done: @escaping @MainActor () -> Void) {
@@ -57,20 +60,48 @@ enum Actions {
         prompt.messageText = "Join a synced folder"
         prompt.informativeText = "Paste the invite link from a machine that already syncs it."
         prompt.accessoryView = field
-        prompt.addButton(withTitle: "Join")
+        prompt.addButton(withTitle: "Next")
         prompt.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
         guard prompt.runModal() == .alertFirstButtonReturn else { return }
         let code = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !code.isEmpty else { return }
-        inBackground(["join", code], failure: "Couldn't join", then: done)
+        guard !code.isEmpty,
+              let url = pickFolder(prompt: "Put it here",
+                                   message: "Choose a new, empty folder for the synced files.")
+        else { return }
+        inBackground(granting: url, failure: "Couldn't join", then: done) {
+            try CLI.run(["join", code, "--folder", url.path])
+        }
     }
 
-    /// Runs a slow CLI command (a join waits on the network) off the main
-    /// thread, so the menu keeps updating; the alert comes back on it.
-    private static func inBackground(_ args: [String], failure: String, then done: @escaping @MainActor () -> Void) {
+    /// The sandbox grants this app a folder only when the user picks it.
+    private static func pickFolder(prompt: String, message: String?) -> URL? {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.prompt = prompt
+        panel.message = message ?? ""
+        NSApp.activate(ignoringOtherApps: true)
+        return panel.runModal() == .OK ? panel.url : nil
+    }
+
+    /// Keeps access to the folder, then runs `work` (a join waits on the
+    /// network) off the main thread; the engine picks the folder up itself.
+    private static func inBackground(
+        granting url: URL,
+        failure: String,
+        then done: @escaping @MainActor () -> Void,
+        work: @escaping @Sendable () throws -> Void
+    ) {
+        do {
+            try Engine.shared.grant(url)
+        } catch {
+            alert(failure, error.localizedDescription)
+            return
+        }
         Task.detached {
-            let result = Result { try CLI.run(args) }
+            let result = Result { try work() }
             await MainActor.run {
                 if case .failure(let error) = result {
                     alert(failure, error.localizedDescription)

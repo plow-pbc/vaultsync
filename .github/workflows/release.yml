@@ -67,6 +67,10 @@ jobs:
       APPLE_TEAM_ID: 3559PD337Z
     steps:
       - uses: actions/checkout@v4
+      # build.sh builds the engine library for both Mac targets.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Sign and notarize VaultSync.app
         run: |
           if [ -z "$APPLE_CERTIFICATE" ]; then

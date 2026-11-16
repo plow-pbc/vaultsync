@@ -1,3 +1,4 @@
+import CVaultSync
 import Foundation
 
 /// One vault as `vaultsync status --json --all` reports it.
@@ -22,39 +23,20 @@ struct VaultStatus: Decodable, Identifiable {
     var name: String { URL(fileURLWithPath: folder).lastPathComponent }
 }
 
-/// Runs the vaultsync CLI, which does all the work; this app only shows it.
+/// The vaultsync engine, linked into this app: the same commands the
+/// command-line tool runs, in-process. The engine does all the work; the app
+/// only shows it.
 enum CLI {
-    static let binary = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".local/bin/vaultsync").path
-
     @discardableResult
     static func run(_ args: [String]) throws -> String {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: binary)
-        process.arguments = args
-        var env = ProcessInfo.processInfo.environment
-        env["PATH"] = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
-        process.environment = env
-        let out = Pipe(), err = Pipe()
-        process.standardOutput = out
-        process.standardError = err
-        try process.run()
-        // Drain stderr alongside stdout, so neither pipe can fill and stall git.
-        var errData = Data()
-        let drained = DispatchGroup()
-        drained.enter()
-        DispatchQueue.global().async {
-            errData = err.fileHandleForReading.readDataToEndOfFile()
-            drained.leave()
+        let request = String(decoding: try JSONSerialization.data(withJSONObject: args), as: UTF8.self)
+        guard let reply = request.withCString({ vs_command($0) }) else {
+            throw CLIError(message: "no reply from the engine")
         }
-        let data = out.fileHandleForReading.readDataToEndOfFile()
-        drained.wait()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
-            throw CLIError(message: String(decoding: errData, as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines))
-        }
-        return String(decoding: data, as: UTF8.self)
+        defer { vs_free(reply) }
+        let object = try JSONSerialization.jsonObject(with: Data(String(cString: reply).utf8)) as? [String: String]
+        if let output = object?["output"] { return output }
+        throw CLIError(message: object?["error"] ?? "")
     }
 
     static func status() throws -> [VaultStatus] {

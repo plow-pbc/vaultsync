@@ -6,6 +6,9 @@
 #   NOTARY_PROFILE=other build.sh
 #   APPLE_ID=… APPLE_PASSWORD=… APPLE_TEAM_ID=… build.sh   notarize with an Apple ID (CI)
 #   SIGN=- build.sh               ad-hoc signed, not notarized (local testing)
+#
+# The engine (crates/ffi) is linked in as a static library; build-engine.sh
+# makes it.
 set -eu
 cd "$(dirname "$0")"
 
@@ -13,6 +16,8 @@ VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml)
 SIGN=${SIGN:-Developer ID Application: The Plow Collective, Inc (3559PD337Z)}
 NOTARY_PROFILE=${NOTARY_PROFILE:-plow-notary}
 APP=build/VaultSync.app
+
+./build-engine.sh
 
 # One build per architecture, joined: a multi-arch `swift build` needs Xcode.
 set --
@@ -35,17 +40,18 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>$VERSION</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>LSUIElement</key><true/>
+    <key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
 </dict>
 </plist>
 PLIST
 
 if [ "$SIGN" = - ]; then
-    codesign --force --sign - "$APP"
+    codesign --force --sign - --entitlements VaultSync.entitlements "$APP"
     ditto -c -k --keepParent "$APP" build/VaultSync.zip
     echo "build/VaultSync.zip (ad-hoc signed, not notarized)"
     exit 0
 fi
-codesign --force --options runtime --timestamp --sign "$SIGN" "$APP"
+codesign --force --options runtime --timestamp --entitlements VaultSync.entitlements --sign "$SIGN" "$APP"
 ditto -c -k --keepParent "$APP" build/VaultSync.zip
 if [ -n "${APPLE_ID:-}" ]; then
     xcrun notarytool submit build/VaultSync.zip --apple-id "$APPLE_ID" \
