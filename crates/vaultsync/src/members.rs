@@ -183,11 +183,13 @@ pub fn validate(repo: &Repository, head: Oid, tip: Oid, trusted: &Members) -> Re
         }
     }
     let vouched = reachable(repo, &introductions, head)?;
-    // Every signed commit must pass as a member's below, or nothing is
-    // accepted; so what lies beneath one was taken in by a member.
-    let signed: Vec<Oid> = signers
+    // Every signed edit must pass as a member's below, or nothing is
+    // accepted; so what lies beneath one was taken in by a member. A merge's
+    // signature is never checked, so it vouches for nothing.
+    let signed: Vec<Oid> = commits
         .iter()
-        .filter_map(|(id, s)| s.map(|_| *id))
+        .filter(|(id, parents)| parents.len() <= 1 && signers[id].is_some())
+        .map(|(id, _)| *id)
         .collect();
     let beneath_signed = reachable(repo, &signed, head)?;
     for (commit, parents) in &commits {

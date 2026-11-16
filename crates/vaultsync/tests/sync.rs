@@ -708,9 +708,9 @@ fn status_json_shows_each_peer_the_last_sync_and_conflicts() {
     );
 }
 
-/// A merge as the first release made them, with git's own merge: unsigned,
-/// and without the line that marks the current engine's merges.
-fn legacy_merge(node: &Node, a: &str, b: &str) -> String {
+/// A merge as the first release made them, with git's own merge: without the
+/// line that marks the current engine's merges, and signed by `signer` if any.
+fn legacy_merge(node: &Node, a: &str, b: &str, signer: Option<&iroh::SecretKey>) -> String {
     let gd = format!("--git-dir={}.git", node.folder.display());
     let (ours, theirs) = if a < b { (a, b) } else { (b, a) };
     let merged = git(
@@ -723,13 +723,13 @@ fn legacy_merge(node: &Node, a: &str, b: &str) -> String {
             &theirs[..12],
         ],
     );
-    unsigned_commit(
-        node,
-        merged.lines().next().unwrap(),
-        &[ours, theirs],
-        "Merge",
-        true,
-    )
+    let tree = merged.lines().next().unwrap();
+    let mut message = "Merge".to_owned();
+    if let Some(key) = signer {
+        message.push_str("\n\n");
+        message.push_str(&vaultsync::members::sign(key, tree, &[ours, theirs]));
+    }
+    unsigned_commit(node, tree, &[ours, theirs], &message, true)
 }
 
 /// Has `mesh.nodes[i]` commit a new note, with only its own daemon running.
@@ -743,7 +743,7 @@ fn edit_alone(mesh: &mut Mesh, i: usize, path: &str) -> String {
 
 #[test]
 fn a_merge_from_the_first_release_counts_only_beneath_a_signed_commit() {
-    for signed_on_top in [true, false] {
+    for case in ["signed on top", "nothing on top", "signs itself"] {
         let mut mesh = Mesh::new(2);
         mesh.start_all();
         mesh.converged(20);
@@ -752,14 +752,16 @@ fn a_merge_from_the_first_release_counts_only_beneath_a_signed_commit() {
         let one = edit_alone(&mut mesh, 1, "one.md");
         move_head(&mesh.nodes[1], &base);
         let two = edit_alone(&mut mesh, 1, "two.md");
-        let legacy = legacy_merge(&mesh.nodes[1], &one, &two);
+        let rogue = iroh::SecretKey::generate();
+        let signer = (case == "signs itself").then_some(&rogue);
+        let legacy = legacy_merge(&mesh.nodes[1], &one, &two, signer);
         move_head(&mesh.nodes[1], &legacy);
-        if signed_on_top {
+        if case == "signed on top" {
             edit_alone(&mut mesh, 1, "three.md");
         }
 
         mesh.start_all();
-        if signed_on_top {
+        if case == "signed on top" {
             mesh.converged(AFTER_RESTART);
             for f in ["one.md", "two.md", "three.md"] {
                 assert!(mesh.nodes[0].read(f).is_some(), "{f}: {}", mesh.logs());
@@ -768,10 +770,10 @@ fn a_merge_from_the_first_release_counts_only_beneath_a_signed_commit() {
             let refused = format!("merge {legacy} is from an earlier vaultsync");
             assert!(
                 wait_until(15, || mesh.nodes[0].log_text().contains(&refused)),
-                "{}",
+                "{case}: {}",
                 mesh.logs()
             );
-            assert_eq!(mesh.nodes[0].read("one.md"), None);
+            assert_eq!(mesh.nodes[0].read("one.md"), None, "{case}");
         }
     }
 }
