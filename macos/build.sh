@@ -4,6 +4,7 @@
 #
 #   build.sh                      sign and notarize (keychain profile plow-notary)
 #   NOTARY_PROFILE=other build.sh
+#   APPLE_ID=… APPLE_PASSWORD=… APPLE_TEAM_ID=… build.sh   notarize with an Apple ID (CI)
 #   SIGN=- build.sh               ad-hoc signed, not notarized (local testing)
 set -eu
 cd "$(dirname "$0")"
@@ -46,7 +47,12 @@ if [ "$SIGN" = - ]; then
 fi
 codesign --force --options runtime --timestamp --sign "$SIGN" "$APP"
 ditto -c -k --keepParent "$APP" build/VaultSync.zip
-xcrun notarytool submit build/VaultSync.zip --keychain-profile "$NOTARY_PROFILE" --wait
+if [ -n "${APPLE_ID:-}" ]; then
+    xcrun notarytool submit build/VaultSync.zip --apple-id "$APPLE_ID" \
+        --password "${APPLE_PASSWORD:?}" --team-id "${APPLE_TEAM_ID:?}" --wait
+else
+    xcrun notarytool submit build/VaultSync.zip --keychain-profile "$NOTARY_PROFILE" --wait
+fi
 xcrun stapler staple "$APP"
 rm build/VaultSync.zip && ditto -c -k --keepParent "$APP" build/VaultSync.zip
 spctl --assess --type execute --verbose "$APP"
