@@ -87,6 +87,12 @@ mkdir -p "$BIN_DIR"
 install -m 755 "$tmp/vaultsync" "$BIN"
 say "Installed $("$BIN" --version) at $BIN"
 
+# A service from before `run --all` names its one vault: list it first, so
+# it stays synced whatever this run adds.
+legacy=$(sed -n -e 's|.*<string>--vault</string><string>\(.*\)</string><string>run</string>.*|\1|p' \
+    -e 's|^ExecStart=".*" --vault "\(.*\)" run$|\1|p' "$PLIST" "$UNIT" 2>/dev/null | head -1)
+if [ -n "$legacy" ]; then "$BIN" --vault "$legacy" track; fi
+
 # Joining or making a vault adds it to the service's list.
 if [ -n "$code" ]; then
     # Drop join's "start syncing with vaultsync run" hint: the service does that.
@@ -95,10 +101,7 @@ if [ -n "$code" ]; then
 elif [ -n "$init" ]; then
     "$BIN" init "$init" ${machine:+--machine "$machine"}
 elif [ -f "$PLIST" ] || [ -f "$UNIT" ]; then
-    # A service from before `run --all` names its one vault: list it.
-    legacy=$(sed -n -e 's|.*<string>--vault</string><string>\(.*\)</string><string>run</string>.*|\1|p' \
-        -e 's|^ExecStart=".*" --vault "\(.*\)" run$|\1|p' "$PLIST" "$UNIT" 2>/dev/null | head -1)
-    if [ -n "$legacy" ]; then "$BIN" --vault "$legacy" track; fi
+    : # an upgrade: the service below picks up the new binary
 else
     say "Binary installed. To sync a vault, run this again with a join code or --init PATH."
     exit 0

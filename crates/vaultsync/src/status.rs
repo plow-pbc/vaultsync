@@ -34,21 +34,11 @@ impl Seen {
             return Ok((Seen::default(), None));
         };
         let v: Value = serde_json::from_str(&text)?;
-        let peers = v["peers"]
-            .as_object()
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, t)| Some((k.clone(), t.as_u64()?)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok((
-            Seen {
-                last_sync: v["last_sync"].as_u64(),
-                peers,
-            },
-            v["updated"].as_u64(),
-        ))
+        let seen = Seen {
+            last_sync: v["last_sync"].as_u64(),
+            peers: serde_json::from_value(v["peers"].clone())?,
+        };
+        Ok((seen, v["updated"].as_u64()))
     }
 
     /// Written whole and renamed into place, so a reader never sees half.
@@ -68,8 +58,7 @@ pub fn json(vault: &Vault) -> Result<Value> {
     let me = vault.node_id()?;
     let peers: Vec<Value> = vault
         .members()?
-        .listed
-        .iter()
+        .active()
         .filter(|(id, _)| **id != me)
         .map(|(id, name)| {
             let last_seen = seen.peers.get(&id.to_string()).copied();

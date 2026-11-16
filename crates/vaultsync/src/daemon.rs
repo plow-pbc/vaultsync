@@ -120,20 +120,10 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
             },
             _ = tokio::time::sleep_until(deadline), if retry.at.is_some() => Event::Edited,
         };
-        match &event {
-            Event::Poke(peer) | Event::Fetched(peer, Ok(())) => {
-                seen.peers.insert(peer.to_string(), now());
-                if matches!(event, Event::Fetched(..)) {
-                    seen.last_sync = Some(now());
-                }
-            }
-            _ => {}
+        if let Event::Poke(peer) | Event::Fetched(peer, Ok(())) = &event {
+            seen.peers.insert(peer.to_string(), now());
         }
-        if !matches!(event, Event::Edited)
-            && let Err(e) = seen.save(&vault)
-        {
-            eprintln!("could not record sync state: {e:#}");
-        }
+        let record = !matches!(event, Event::Edited);
         match event {
             Event::Edited => edited(&vault, &net, &mut retry, &mut announced).await,
             Event::Poke(peer) => fetches.start(&vault, &net, &events, peer),
@@ -144,11 +134,18 @@ async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
             }
             Event::Fetched(peer, result) => {
                 match result {
-                    Ok(()) => integrate(&vault, &net, peer, &mut announced).await,
+                    Ok(()) => {
+                        if integrate(&vault, &net, peer, &mut announced).await {
+                            seen.last_sync = Some(now());
+                        }
+                    }
                     Err(e) => eprintln!("could not fetch from {}: {e:#}", peer.fmt_short()),
                 }
                 fetches.finish(&vault, &net, &events, peer);
             }
+        }
+        if record && let Err(e) = seen.save(&vault) {
+            eprintln!("could not record sync state: {e:#}");
         }
     }
     Ok(())
@@ -271,14 +268,24 @@ impl Fetches {
     }
 }
 
-async fn integrate(vault: &Vault, net: &Net, peer: EndpointId, announced: &mut Option<String>) {
+/// Takes in what `peer` sent; false when it was refused.
+async fn integrate(
+    vault: &Vault,
+    net: &Net,
+    peer: EndpointId,
+    announced: &mut Option<String>,
+) -> bool {
     match blocking(vault, move |v| v.integrate(&peer)).await {
         Ok(Some(head)) => {
             eprintln!("synced {} from {}", &head[..7], peer.fmt_short());
             announce(vault, net, announced).await;
+            true
         }
-        Ok(None) => {}
-        Err(e) => eprintln!("{e:#}"),
+        Ok(None) => true,
+        Err(e) => {
+            eprintln!("{e:#}");
+            false
+        }
     }
 }
 

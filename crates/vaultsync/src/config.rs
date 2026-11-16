@@ -1,5 +1,5 @@
 //! The vaults this user's background service runs: one folder per line in
-//! `~/.config/vaultsync/vaults` (`$XDG_CONFIG_HOME` honored).
+//! `~/.config/vaultsync/vaults`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,11 +7,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 fn path() -> Result<PathBuf> {
-    let base = match std::env::var_os("XDG_CONFIG_HOME") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?).join(".config"),
+    // Tests point this elsewhere; the service and the CLI always agree on it.
+    let dir = match std::env::var_os("VAULTSYNC_CONFIG_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?)
+            .join(".config/vaultsync"),
     };
-    Ok(base.join("vaultsync").join("vaults"))
+    Ok(dir.join("vaults"))
 }
 
 pub fn vaults() -> Result<Vec<PathBuf>> {
@@ -41,6 +43,10 @@ pub fn track(folder: &Path) -> Result<()> {
         .iter()
         .map(|v| format!("{}\n", v.display()))
         .collect();
-    fs::write(path, text)?;
+    // Renamed into place: never half written, and a symlink at the path is
+    // replaced rather than followed.
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    fs::write(&tmp, text)?;
+    fs::rename(tmp, path)?;
     Ok(())
 }

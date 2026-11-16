@@ -9,7 +9,7 @@ use std::process::{Child, Command, Output, Stdio};
 pub fn bin() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_vaultsync"));
     cmd.env(
-        "XDG_CONFIG_HOME",
+        "VAULTSYNC_CONFIG_DIR",
         std::env::temp_dir().join("vaultsync-tests-config"),
     );
     cmd
