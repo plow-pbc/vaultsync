@@ -71,7 +71,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - name: Sign and notarize VaultSync.app
+      - name: Sign and notarize BrainSync by Plow
         run: |
           if [ -z "$APPLE_CERTIFICATE" ]; then
             echo "::notice::no signing secrets; releasing without the menu-bar app"
@@ -88,11 +88,11 @@ jobs:
           security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           macos/build.sh
-          mkdir dist && cp macos/build/VaultSync.zip dist/VaultSync.zip
+          mkdir dist && cp macos/build/BrainSync-by-Plow.dmg dist/
       - uses: actions/upload-artifact@v4
         with:
-          name: VaultSync-app
-          path: dist/VaultSync.zip
+          name: BrainSync-app
+          path: dist/BrainSync-by-Plow.dmg
           if-no-files-found: ignore
 
   publish:

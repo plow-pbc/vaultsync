@@ -7,12 +7,23 @@ import ServiceManagement
 struct VaultSyncBarApp: App {
     @NSApplicationDelegateAdaptor private var delegate: AppDelegate
     @State private var model = Model()
+    /// The Plow mark, as a template image macOS tints for the menu bar.
+    private static let menuMark: NSImage? = {
+        let mark = NSImage(named: "MenuIcon")
+        mark?.isTemplate = true
+        return mark
+    }()
 
     var body: some Scene {
         MenuBarExtra {
             MenuContent(model: model)
         } label: {
-            Image(systemName: model.symbol)
+            if model.healthy, let mark = Self.menuMark {
+                Image(nsImage: mark).accessibilityLabel("BrainSync by Plow")
+            } else {
+                Image(systemName: "exclamationmark.arrow.triangle.2.circlepath")
+                    .accessibilityLabel("BrainSync by Plow needs attention")
+            }
         }
         .menuBarExtraStyle(.menu)
     }
@@ -70,11 +81,10 @@ final class Model {
     }
 
     /// Filled when every folder is in sync, an exclamation mark otherwise.
-    var symbol: String {
-        let healthy = problem == nil && vaults.allSatisfy {
+    var healthy: Bool {
+        problem == nil && vaults.allSatisfy {
             $0.error == nil && $0.running == true && ($0.conflicts ?? []).isEmpty && ($0.pending ?? 0) == 0
         }
-        return healthy ? "arrow.triangle.2.circlepath.circle.fill" : "exclamationmark.arrow.triangle.2.circlepath"
     }
 }
 
@@ -82,8 +92,9 @@ struct MenuContent: View {
     let model: Model
 
     var body: some View {
+        Text("BrainSync by Plow")
         if let problem = model.problem {
-            Text("vaultsync isn't answering: \(problem)")
+            Text("BrainSync isn't answering: \(problem)")
         }
         if model.vaults.isEmpty && model.problem == nil {
             Text("No synced folders yet")
