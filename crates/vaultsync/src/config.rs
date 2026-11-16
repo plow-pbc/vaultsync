@@ -15,7 +15,11 @@ fn path() -> Result<PathBuf> {
 }
 
 pub fn vaults() -> Result<Vec<PathBuf>> {
-    let text = fs::read_to_string(path()?).unwrap_or_default();
+    let path = path()?;
+    let text = match fs::read_to_string(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        read => read.with_context(|| format!("reading {}", path.display()))?,
+    };
     Ok(text
         .lines()
         .map(str::trim)

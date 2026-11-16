@@ -133,11 +133,19 @@ fn main() -> Result<()> {
         Cmd::Status { json: false, .. } => print!("{}", open()?.status()?),
         Cmd::Status { json: true, all } => {
             let value = if all {
-                let vaults: Result<Vec<_>> = config::vaults()?
+                // A vault moved or deleted since it was listed reports its
+                // error; the others still show.
+                let vaults: Vec<_> = config::vaults()?
                     .iter()
-                    .map(|folder| status::json(&Vault::open(folder)?))
+                    .map(|folder| {
+                        Vault::open(folder)
+                            .and_then(|vault| status::json(&vault))
+                            .unwrap_or_else(|e| {
+                                serde_json::json!({"folder": folder, "error": format!("{e:#}")})
+                            })
+                    })
                     .collect();
-                serde_json::Value::from(vaults?)
+                serde_json::Value::from(vaults)
             } else {
                 status::json(&open()?)?
             };

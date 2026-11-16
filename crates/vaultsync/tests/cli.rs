@@ -404,15 +404,24 @@ fn one_service_runs_every_tracked_vault_including_ones_added_later() {
     fs::write(folder("c").join("note.md"), "in c\n").unwrap();
     assert!(committed("c", "note.md"));
 
+    // A listed vault that has since gone reports an error; the rest still show.
+    run(&[
+        "init",
+        folder("gone").to_str().unwrap(),
+        "--machine",
+        MACHINE,
+    ]);
+    fs::remove_dir_all(folder("gone")).unwrap();
     let all: serde_json::Value =
         serde_json::from_str(&run(&["status", "--json", "--all"])).unwrap();
     let all = all.as_array().unwrap();
-    assert_eq!(all.len(), 3);
-    for vault in all {
+    assert_eq!(all.len(), 4);
+    for vault in &all[..3] {
         assert_eq!(vault["running"], true, "{vault}");
         assert_eq!(vault["pending"], 0, "{vault}");
         assert_eq!(vault["machine"], MACHINE);
     }
+    assert!(all[3]["error"].is_string(), "{}", all[3]);
     service.kill().unwrap();
     service.wait().unwrap();
 }
