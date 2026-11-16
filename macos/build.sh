@@ -1,7 +1,7 @@
 #!/bin/sh
-# Builds "BrainSync by Plow.app" (arm64 + x86_64), signs it with the team's
+# Builds "WikiSync by Plow.app" (arm64 + x86_64), signs it with the team's
 # Developer ID, notarizes and staples it, and packs it into
-# build/BrainSync-by-Plow.dmg.
+# build/WikiSync-by-Plow.dmg.
 #
 #   build.sh                      sign and notarize (keychain profile plow-notary)
 #   NOTARY_PROFILE=other build.sh
@@ -18,10 +18,10 @@ cd "$(dirname "$0")"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' ../Cargo.toml)
 SIGN=${SIGN:-Developer ID Application: The Plow Collective, Inc (3559PD337Z)}
 NOTARY_PROFILE=${NOTARY_PROFILE:-plow-notary}
-APP="build/BrainSync by Plow.app"
+APP="build/WikiSync by Plow.app"
 ENTITLEMENTS=
 if [ "${SANDBOX:-0}" = 1 ]; then ENTITLEMENTS=VaultSync.entitlements; fi
-DMG=build/BrainSync-by-Plow.dmg
+DMG=build/WikiSync-by-Plow.dmg
 
 ./build-engine.sh
 
@@ -41,8 +41,8 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key><string>co.plow.vaultsync</string>
-    <key>CFBundleName</key><string>BrainSync</string>
-    <key>CFBundleDisplayName</key><string>BrainSync by Plow</string>
+    <key>CFBundleName</key><string>WikiSync</string>
+    <key>CFBundleDisplayName</key><string>WikiSync by Plow</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundleExecutable</key><string>VaultSync</string>
     <key>CFBundlePackageType</key><string>APPL</string>
@@ -58,7 +58,7 @@ PLIST
 # The app beside an Applications link: open it, drag one onto the other.
 dmg() {
     rm -rf build/dmg "$DMG" && mkdir build/dmg && cp -R "$APP" build/dmg/ && ln -s /Applications build/dmg/Applications
-    hdiutil create -quiet -volname "BrainSync by Plow" -srcfolder build/dmg -format UDZO "$DMG"
+    hdiutil create -quiet -volname "WikiSync by Plow" -srcfolder build/dmg -format UDZO "$DMG"
     rm -rf build/dmg
 }
 if [ "$SIGN" = - ]; then

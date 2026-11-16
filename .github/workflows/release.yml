@@ -70,7 +70,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
-      - name: Build BrainSync by Plow (signed and notarized when the secrets exist)
+      - name: Build WikiSync by Plow (signed and notarized when the secrets exist)
         run: |
           if [ -z "$APPLE_CERTIFICATE" ]; then
             echo "::notice::no signing secrets; the app is ad-hoc signed"
@@ -88,12 +88,12 @@ jobs:
             security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           fi
           macos/build.sh
-          mkdir dist && cp macos/build/BrainSync-by-Plow.dmg dist/
-          (cd dist && shasum -a 256 BrainSync-by-Plow.dmg > BrainSync-by-Plow.dmg.sha256)
+          mkdir dist && cp macos/build/WikiSync-by-Plow.dmg dist/
+          (cd dist && shasum -a 256 WikiSync-by-Plow.dmg > WikiSync-by-Plow.dmg.sha256)
       - uses: actions/upload-artifact@v4
         with:
-          name: BrainSync-app
-          path: dist/BrainSync-by-Plow.dmg*
+          name: WikiSync-app
+          path: dist/WikiSync-by-Plow.dmg*
 
   publish:
     if: startsWith(github.ref, 'refs/tags/')

@@ -142,17 +142,18 @@ EOF
     # The menu-bar app shows what the service syncs. A download by curl
     # carries no quarantine flag, so macOS opens it however it is signed.
     # Without it a Mac has no sign of syncing, so failing to get it is an error.
-    app="$HOME/Applications/BrainSync by Plow.app"
-    if fetch BrainSync-by-Plow.dmg; then
-        hdiutil attach -quiet -nobrowse -readonly -mountpoint "$tmp/dmg" "$tmp/BrainSync-by-Plow.dmg"
+    app="$HOME/Applications/WikiSync by Plow.app"
+    if fetch WikiSync-by-Plow.dmg; then
+        hdiutil attach -quiet -nobrowse -readonly -mountpoint "$tmp/dmg" "$tmp/WikiSync-by-Plow.dmg"
         osascript -e 'quit app id "co.plow.vaultsync"' 2>/dev/null || true
-        mkdir -p "$HOME/Applications" && rm -rf "$app"
-        ditto "$tmp/dmg/BrainSync by Plow.app" "$app"
+        # The same app under its 0.3.2 name: replaced, so there is only one.
+        mkdir -p "$HOME/Applications" && rm -rf "$app" "$HOME/Applications/BrainSync by Plow.app"
+        ditto "$tmp/dmg/WikiSync by Plow.app" "$app"
         hdiutil detach -quiet "$tmp/dmg"
         open "$app"
-        say "Installed the BrainSync menu-bar app in ~/Applications"
+        say "Installed the WikiSync menu-bar app in ~/Applications"
     else
-        die "syncing is set up, but the BrainSync app couldn't be downloaded from $BASE; run this again"
+        die "syncing is set up, but the WikiSync app couldn't be downloaded from $BASE; run this again"
     fi
 else
     mkdir -p "$(dirname "$UNIT")"

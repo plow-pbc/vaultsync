@@ -19,10 +19,10 @@ struct VaultSyncBarApp: App {
             MenuContent(model: model)
         } label: {
             if model.healthy, let mark = Self.menuMark {
-                Image(nsImage: mark).accessibilityLabel("BrainSync by Plow")
+                Image(nsImage: mark).accessibilityLabel("WikiSync by Plow")
             } else {
                 Image(systemName: "exclamationmark.arrow.triangle.2.circlepath")
-                    .accessibilityLabel("BrainSync by Plow needs attention")
+                    .accessibilityLabel("WikiSync by Plow needs attention")
             }
         }
         .menuBarExtraStyle(.menu)
@@ -92,9 +92,9 @@ struct MenuContent: View {
     let model: Model
 
     var body: some View {
-        Text("BrainSync by Plow")
+        Text("WikiSync by Plow")
         if let problem = model.problem {
-            Text("BrainSync isn't answering: \(problem)")
+            Text("WikiSync isn't answering: \(problem)")
         }
         if model.vaults.isEmpty && model.problem == nil {
             Text("No synced folders yet")
