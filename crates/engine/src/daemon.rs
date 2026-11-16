@@ -23,6 +23,8 @@ use crate::vault::Vault;
 const DEBOUNCE: Duration = Duration::from_millis(500);
 /// How often to look for changes when polling.
 const POLL: Duration = Duration::from_secs(2);
+/// How often a daemon waiting on another checks whether it stopped.
+const LOCK_POLL: Duration = Duration::from_secs(2);
 /// How often `run --all` rereads the list of vaults.
 const CONFIG_POLL: Duration = Duration::from_secs(5);
 
@@ -73,6 +75,27 @@ pub fn run_all(opts: Opts) -> Result<()> {
 }
 
 async fn daemon(vault: Vault, opts: Opts) -> Result<()> {
+    // One daemon per vault, whichever edition runs it: a second one (the
+    // Mac app taking over from the command-line service, say) waits here
+    // until the first stops. The lock goes with the process.
+    let lock = std::fs::File::create(vault.run_lock()?)?;
+    let mut said = false;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if !said {
+                    eprintln!(
+                        "{}: another vaultsync is running this vault; waiting for it to stop",
+                        vault.folder().display()
+                    );
+                    said = true;
+                }
+                tokio::time::sleep(LOCK_POLL).await;
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(e.into()),
+        }
+    }
     vault.unpin_all()?;
     let net = Net::bind(vault.secret_key()?, opts.addr_dir.as_deref()).await?;
     let (events, mut rx) = mpsc::unbounded_channel();
