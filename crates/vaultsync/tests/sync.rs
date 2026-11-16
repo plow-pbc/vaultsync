@@ -900,6 +900,6 @@ fn a_commit_that_would_write_into_the_history_is_refused() {
         mesh.logs()
     );
     let a = &mesh.nodes[0];
-    assert!(!a.folder.join(".VaultSync").exists());
+    assert!(!a.folder.join(".VaultSync/marker").exists());
     assert!(!history_dir(&a.folder).join("marker").exists());
 }

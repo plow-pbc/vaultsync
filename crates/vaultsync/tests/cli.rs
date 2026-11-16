@@ -59,6 +59,12 @@ fn init_fresh_folder_keeps_history_inside_it() {
         let folder = tmp.path().join("notes");
         fs::create_dir_all(folder.join("sub")).unwrap();
         fs::write(folder.join("a.md"), "hello\n").unwrap();
+        // An ignore rule that would bring the history, and its key, back in.
+        fs::write(
+            folder.join(".gitignore"),
+            "!*\n!.vaultsync/\n!.vaultsync/**\n",
+        )
+        .unwrap();
         if unborn {
             git(&folder, &["init", "-q"]);
         }
@@ -78,7 +84,7 @@ fn init_fresh_folder_keeps_history_inside_it() {
         );
         // The history is never one of the vault's files.
         let gd = format!("--git-dir={}", history_dir(&folder).display());
-        assert_eq!(git(tmp.path(), &[&gd, "ls-files"]), "a.md\n");
+        assert_eq!(git(tmp.path(), &[&gd, "ls-files"]), ".gitignore\na.md\n");
 
         fs::write(folder.join("b.md"), "new\n").unwrap();
         let status = ok(&folder, &["status"]);

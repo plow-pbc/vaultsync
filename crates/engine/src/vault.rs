@@ -47,8 +47,13 @@ fn beside(folder: &Path) -> PathBuf {
 /// Whether `tree` would write into a vault's history folder, in any case
 /// (macOS folders don't tell `.VaultSync` from `.vaultsync`).
 fn writes_into_history(tree: &Tree) -> bool {
-    tree.iter()
-        .any(|e| e.name_bytes().eq_ignore_ascii_case(HISTORY.as_bytes()))
+    tree.iter().any(|e| in_history(e.name_bytes()))
+}
+
+/// Whether a vault-relative path is the history folder or inside it.
+fn in_history(path: &[u8]) -> bool {
+    let first = path.split(|b| *b == b'/').next().unwrap_or_default();
+    first.eq_ignore_ascii_case(HISTORY.as_bytes())
 }
 
 /// Adds `line` to `file` unless it is there already.
@@ -592,14 +597,17 @@ impl Vault {
     }
 
     /// `git add -A`: the index takes every change in the folder, ignored
-    /// files aside. Written only when that changed it: a process stopped
-    /// mid-write leaves the index locked.
+    /// files aside, and never the history, whatever a synced `.gitignore`
+    /// says: it holds this machine's key. Written only when that changed it:
+    /// a process stopped mid-write leaves the index locked.
     fn stage_all(&self, repo: &Repository) -> Result<Index> {
         let mut index = repo.index()?;
         let entries =
             |index: &Index| -> Vec<_> { index.iter().map(|e| (e.path, e.id, e.mode)).collect() };
         let before = entries(&index);
-        index.add_all(["*"], IndexAddOption::DEFAULT, None)?;
+        let mut skip_history =
+            |path: &Path, _: &[u8]| i32::from(in_history(path.as_os_str().as_bytes()));
+        index.add_all(["*"], IndexAddOption::DEFAULT, Some(&mut skip_history))?;
         index.update_all(["*"], None)?;
         if entries(&index) != before {
             index.write()?;
@@ -635,7 +643,12 @@ impl Vault {
     pub fn pending(&self) -> Result<usize> {
         let mut opts = StatusOptions::new();
         opts.include_untracked(true).include_ignored(false);
-        Ok(self.repo()?.statuses(Some(&mut opts))?.len())
+        let repo = self.repo()?;
+        let statuses = repo.statuses(Some(&mut opts))?;
+        Ok(statuses
+            .iter()
+            .filter(|s| !in_history(s.path_bytes()))
+            .count())
     }
 
     /// Files a merge left for a person: text with conflict markers, and the
