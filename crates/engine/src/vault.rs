@@ -490,6 +490,11 @@ impl Vault {
         Ok(files)
     }
 
+    /// Held by the one daemon running this vault.
+    pub fn run_lock(&self) -> Result<PathBuf> {
+        self.state("run.lock")
+    }
+
     /// Where the running daemon keeps what it knows about its peers.
     pub fn daemon_state(&self) -> Result<PathBuf> {
         self.state("daemon.json")
