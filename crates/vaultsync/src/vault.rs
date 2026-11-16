@@ -788,13 +788,13 @@ impl Vault {
             return Ok(false);
         }
         let intent = self.state("apply")?;
-        fs::write(&intent, format!("started {old} {new}\n"))?;
+        write_whole(&intent, &format!("started {old} {new}\n"))?;
         crash_if_hooked("crash-before-worktree");
         if self.git.run(["read-tree", "-m", "-u", old, new]).is_err() {
             fs::remove_file(&intent)?;
             return Ok(false);
         }
-        fs::write(&intent, format!("written {old} {new}\n"))?;
+        write_whole(&intent, &format!("written {old} {new}\n"))?;
         crash_if_hooked("crash-after-worktree");
         self.git.run(["update-ref", "HEAD", new, old])?;
         fs::remove_file(&intent)?;
@@ -820,6 +820,15 @@ impl Vault {
         fs::remove_file(&intent)?;
         Ok(())
     }
+}
+
+/// Replaces `path` by renaming a finished copy over it: a crash leaves the
+/// old contents or the new, never an empty or half-written file.
+fn write_whole(path: &Path, contents: &str) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, contents)?;
+    fs::rename(tmp, path)?;
+    Ok(())
 }
 
 /// Fault injection for tests: `VAULTSYNC_TEST_HOOK=<name>`.
