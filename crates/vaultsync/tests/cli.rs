@@ -159,31 +159,49 @@ fn init_refuses_unusable_history_and_moves_nothing() {
 }
 
 #[test]
-fn failed_auto_commit_is_retried_without_another_edit() {
-    let tmp = tempfile::tempdir().unwrap();
-    let folder = tmp.path().join("notes");
-    init(&folder);
-    let mut daemon = start_daemon(&folder, &[], "");
-    let mut stderr = BufReader::new(daemon.stderr.take().unwrap());
+fn a_held_index_is_waited_for_and_one_left_by_a_killed_process_is_cleared() {
+    for left_by_a_kill in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("notes");
+        init(&folder);
+        let index_lock = history_dir(&folder).join("index.lock");
+        let lock = fs::File::create(&index_lock).unwrap();
+        if left_by_a_kill {
+            // Written minutes ago by a process that never got to remove it.
+            let then = std::time::SystemTime::now() - Duration::from_secs(120);
+            lock.set_modified(then).unwrap();
+        }
+        let mut daemon = start_daemon(&folder, &[], "");
+        let mut stderr = BufReader::new(daemon.stderr.take().unwrap());
+        fs::write(folder.join("held.md"), "saved while git was busy\n").unwrap();
+        let mut line = String::new();
+        let awaited = if left_by_a_kill {
+            "removed"
+        } else {
+            "commit failed"
+        };
+        let waiting = Instant::now();
+        while !line.contains(awaited) {
+            assert!(
+                waiting.elapsed() < Duration::from_secs(20),
+                "never logged {awaited:?}"
+            );
+            line.clear();
+            assert_ne!(stderr.read_line(&mut line).unwrap(), 0, "daemon exited");
+        }
+        // Another git process holding it lets go; a dead one never would.
+        if !left_by_a_kill {
+            fs::remove_file(&index_lock).unwrap();
+        }
 
-    // Another git process holds the index, so the commit fails.
-    let index_lock = history_dir(&folder).join("index.lock");
-    fs::write(&index_lock, "").unwrap();
-    fs::write(folder.join("held.md"), "saved while git was busy\n").unwrap();
-    let mut line = String::new();
-    while !line.contains("commit failed") {
-        line.clear();
-        assert_ne!(stderr.read_line(&mut line).unwrap(), 0, "daemon exited");
+        let start = Instant::now();
+        while !ok(&folder, &["log", "-n", "1"]).contains("Update held.md") {
+            assert!(start.elapsed() < Duration::from_secs(10), "never committed");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        daemon.kill().unwrap();
+        daemon.wait().unwrap();
     }
-    fs::remove_file(&index_lock).unwrap();
-
-    let start = Instant::now();
-    while !ok(&folder, &["log", "-n", "1"]).contains("Update held.md") {
-        assert!(start.elapsed() < Duration::from_secs(10), "never retried");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    daemon.kill().unwrap();
-    daemon.wait().unwrap();
 }
 
 #[test]

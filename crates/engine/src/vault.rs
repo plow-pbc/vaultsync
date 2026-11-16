@@ -20,6 +20,10 @@ use crate::merge::{index_entry, merge};
 const MACHINE_KEY: &str = "vaultsync.machine";
 /// Tries before giving up on landing a sync over files that keep changing.
 const APPLY_TRIES: usize = 5;
+/// An `index.lock` this old was left by a process that died mid-write: every
+/// writer here holds `vaultsync.lock` first, and an outside git reader holds
+/// the index for milliseconds.
+const STALE_INDEX_LOCK: Duration = Duration::from_secs(60);
 
 /// Where a vault keeps its history: a hidden folder inside it, so that a
 /// sandboxed app's access to the folder covers it, and named other than
@@ -556,11 +560,21 @@ impl Vault {
     }
 
     /// Serializes everything that writes to the index, the work tree or HEAD,
-    /// and finishes a sync that a crash interrupted.
+    /// and finishes a sync or a write that a crash interrupted.
     fn lock(&self) -> Result<File> {
         let file = File::create(self.git_dir.join("vaultsync.lock"))?;
         file.lock()?;
         self.recover()?;
+        let index_lock = self.git_dir.join("index.lock");
+        if let Ok(meta) = fs::metadata(&index_lock)
+            && meta.modified()?.elapsed().unwrap_or_default() >= STALE_INDEX_LOCK
+        {
+            fs::remove_file(&index_lock)?;
+            eprintln!(
+                "removed {}, left by a process stopped mid-write",
+                index_lock.display()
+            );
+        }
         Ok(file)
     }
 
