@@ -3,49 +3,23 @@ import AppKit
 @MainActor
 enum Actions {
     static func openInObsidian(_ vault: VaultStatus) {
-        open(path: vault.folder, in: vault.folder)
+        open(path: vault.folder)
     }
 
     /// Opens a note in Obsidian, or in the default app when Obsidian isn't installed.
     static func open(file: String, in vault: VaultStatus) {
-        open(path: (vault.folder as NSString).appendingPathComponent(file), in: vault.folder)
+        open(path: (vault.folder as NSString).appendingPathComponent(file))
     }
 
-    /// Obsidian opens a path by URL only inside a folder it knows as a vault,
-    /// from the list it reads as it starts and rewrites as it quits. A folder
-    /// it doesn't know yet is added there with Obsidian closed, then opened.
-    private static func open(path: String, in folder: String) {
+    private static func open(path: String) {
         var parts = URLComponents()
         parts.scheme = "obsidian"
         parts.host = "open"
         parts.queryItems = [URLQueryItem(name: "path", value: path)]
-        guard let url = parts.url, NSWorkspace.shared.urlForApplication(toOpen: url) != nil else {
+        if let url = parts.url, NSWorkspace.shared.urlForApplication(toOpen: url) != nil {
+            NSWorkspace.shared.open(url)
+        } else {
             NSWorkspace.shared.open(URL(fileURLWithPath: path))
-            return
-        }
-        // The App Store build can't reach Obsidian's settings.
-        if Engine.sandboxed || ObsidianVaults.contains(folder) {
-            NSWorkspace.shared.open(url)
-            return
-        }
-        Task {
-            for app in NSRunningApplication.runningApplications(withBundleIdentifier: "md.obsidian") {
-                app.terminate()
-                let asked = Date()
-                while !app.isTerminated {
-                    guard Date().timeIntervalSince(asked) < 60 else {
-                        return alert("Obsidian didn't quit", "Quit Obsidian, then choose Open in Obsidian again.")
-                    }
-                    try? await Task.sleep(for: .milliseconds(250))
-                }
-            }
-            do {
-                try ObsidianVaults.add(folder)
-            } catch {
-                return alert("Couldn't add \((folder as NSString).lastPathComponent) to Obsidian",
-                             error.localizedDescription)
-            }
-            NSWorkspace.shared.open(url)
         }
     }
 
@@ -143,42 +117,5 @@ enum Actions {
         alert.informativeText = text
         NSApp.activate(ignoringOtherApps: true)
         alert.runModal()
-    }
-}
-
-/// Obsidian's own list of vaults, the folders it opens by URL.
-enum ObsidianVaults {
-    private static let list = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/obsidian/obsidian.json")
-
-    private static func read() -> [String: Any] {
-        guard let data = try? Data(contentsOf: list),
-              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return [:] }
-        return object
-    }
-
-    private static var paths: [String] {
-        let vaults = read()["vaults"] as? [String: [String: Any]] ?? [:]
-        return vaults.values.compactMap { $0["path"] as? String }
-    }
-
-    /// Whether `folder` is a vault Obsidian knows, or inside one.
-    static func contains(_ folder: String) -> Bool {
-        paths.contains { folder == $0 || folder.hasPrefix($0 + "/") }
-    }
-
-    /// Adds `folder` as Obsidian adds a vault: a random 16-digit id, the path
-    /// and the time in milliseconds. Every other setting is kept.
-    static func add(_ folder: String) throws {
-        guard !contains(folder) else { return }
-        var settings = read()
-        var vaults = settings["vaults"] as? [String: Any] ?? [:]
-        let id = (0..<8).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
-        vaults[id] = ["path": folder, "ts": Int(Date().timeIntervalSince1970 * 1000)]
-        settings["vaults"] = vaults
-        try FileManager.default.createDirectory(at: list.deletingLastPathComponent(),
-                                                withIntermediateDirectories: true)
-        try JSONSerialization.data(withJSONObject: settings).write(to: list, options: .atomic)
     }
 }
