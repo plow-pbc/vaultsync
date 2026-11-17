@@ -38,6 +38,22 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+# bootout returns while the old service may still be exiting, and launchd
+# refuses to bootstrap it again ("5: Input/output error") until it's gone.
+# launchd kills a service that hasn't exited after 20 seconds.
+wait_unloaded() {
+    i=0
+    while launchctl print "gui/$(id -u)/$NAME" >/dev/null 2>&1 && [ $i -lt 300 ]; do
+        sleep 0.1; i=$((i + 1))
+    done
+}
+
+start_service() {
+    launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null || {
+        sleep 1; wait_unloaded; launchctl bootstrap "gui/$(id -u)" "$PLIST"
+    }
+}
+
 case $(uname -s) in
     Darwin) os=macos ;;
     Linux) os=linux ;;
@@ -47,6 +63,7 @@ esac
 stop_service() {
     if [ $os = macos ]; then
         launchctl bootout "gui/$(id -u)/$NAME" 2>/dev/null || true
+        wait_unloaded
     else
         systemctl --user disable --now "$NAME" 2>/dev/null || true
     fi
@@ -137,8 +154,14 @@ if [ $os = macos ]; then
 </plist>
 EOF
     stop_service
-    launchctl bootstrap "gui/$(id -u)" "$PLIST"
-    say "Running as launchd agent '$NAME'; log: ~/Library/Logs/$NAME.log"
+    # Installing the app goes ahead whatever happens here, so nothing is left
+    # half upgraded; a service that won't start fails the install at the end.
+    if start_service; then
+        say "Running as launchd agent '$NAME'; log: ~/Library/Logs/$NAME.log"
+        started=1
+    else
+        started=''
+    fi
     # The menu-bar app shows what the service syncs. A download by curl
     # carries no quarantine flag, so macOS opens it however it is signed.
     # Without it a Mac has no sign of syncing, so failing to get it is an error.
@@ -155,6 +178,7 @@ EOF
     else
         die "syncing is set up, but the WikiSync app couldn't be downloaded from $BASE; run this again"
     fi
+    [ -n "$started" ] || die "sync is not running: launchd wouldn't start '$NAME' ($PLIST); run this again, and if it fails again, restart the Mac"
 else
     mkdir -p "$(dirname "$UNIT")"
     cat > "$UNIT" <<EOF

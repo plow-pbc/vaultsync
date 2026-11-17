@@ -4,7 +4,7 @@ on:
     tags: ['v*']
   # Build (but don't publish) when the release pipeline itself changes.
   pull_request:
-    paths: ['.github/workflows/release.yml', 'install.sh']
+    paths: ['.github/workflows/release.yml', 'install.sh', 'scripts/test-install.sh']
 
 permissions:
   contents: read
@@ -51,7 +51,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: shellcheck install.sh
+      - run: shellcheck install.sh scripts/test-install.sh
 
   # The menu-bar app, signed and notarized: one job, on release tags only.
   # Skipped, and the release published without it, until the repository has
