@@ -151,29 +151,28 @@ enum ObsidianVaults {
     private static let list = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Application Support/obsidian/obsidian.json")
 
-    /// The settings, or none if Obsidian has never run; a file that can't be
-    /// read is an error, so it is never written over.
-    private static func read() throws -> [String: Any] {
-        guard FileManager.default.fileExists(atPath: list.path) else { return [:] }
-        guard let object = try JSONSerialization.jsonObject(with: Data(contentsOf: list)) as? [String: Any]
-        else { throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: list.path]) }
+    private static func read() -> [String: Any] {
+        guard let data = try? Data(contentsOf: list),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return [:] }
         return object
+    }
+
+    private static var paths: [String] {
+        let vaults = read()["vaults"] as? [String: [String: Any]] ?? [:]
+        return vaults.values.compactMap { $0["path"] as? String }
     }
 
     /// Whether `folder` is a vault Obsidian knows, or inside one.
     static func contains(_ folder: String) -> Bool {
-        let vaults = (try? read())?["vaults"] as? [String: [String: Any]] ?? [:]
-        return vaults.values.contains {
-            guard let path = $0["path"] as? String else { return false }
-            return folder == path || folder.hasPrefix(path + "/")
-        }
+        paths.contains { folder == $0 || folder.hasPrefix($0 + "/") }
     }
 
     /// Adds `folder` as Obsidian adds a vault: a random 16-digit id, the path
     /// and the time in milliseconds. Every other setting is kept.
     static func add(_ folder: String) throws {
         guard !contains(folder) else { return }
-        var settings = try read()
+        var settings = read()
         var vaults = settings["vaults"] as? [String: Any] ?? [:]
         let id = (0..<8).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
         vaults[id] = ["path": folder, "ts": Int(Date().timeIntervalSince1970 * 1000)]
