@@ -20,7 +20,7 @@ final class Engine {
         guard !started else { return }
         started = true
         if Self.serviceRunsVaults {
-            NSLog("BrainSync: the vaultsync service runs the vaults; showing them")
+            NSLog("WikiSync: the vaultsync service runs the vaults; showing them")
             return
         }
         for (path, data) in bookmarks {
