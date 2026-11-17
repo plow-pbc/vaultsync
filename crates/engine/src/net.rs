@@ -8,10 +8,11 @@
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use iroh::endpoint::{Connection, ConnectionError, Incoming, QuicTransportConfig, presets};
+use iroh::endpoint::{Connection, ConnectionError, IncomingAddr, QuicTransportConfig, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, SecretKey};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::UnboundedSender;
@@ -39,6 +40,7 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(300);
 /// A restarted peer is unreachable while a connection to its dead instance
 /// lingers, since iroh sends new dials down that connection's path.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const UNIDENTIFIED_REPORT_EVERY: Duration = Duration::from_secs(600);
 
 /// What the daemon reacts to.
 pub enum Event {
@@ -218,7 +220,12 @@ impl Net {
         while let Some(incoming) = self.endpoint.accept().await {
             let (vault, events) = (vault.clone(), events.clone());
             tokio::spawn(async move {
-                if let Err(e) = answer(incoming, vault, events).await {
+                let from = incoming.remote_addr();
+                let conn = match incoming.await {
+                    Ok(conn) => conn,
+                    Err(e) => return unidentified(&from, &e),
+                };
+                if let Err(e) = answer(conn, vault, events).await {
                     eprintln!("request failed: {e:#}");
                 }
             });
@@ -226,8 +233,35 @@ impl Net {
     }
 }
 
-async fn answer(incoming: Incoming, vault: Vault, events: UnboundedSender<Event>) -> Result<()> {
-    let conn = incoming.await?;
+/// Notes a connection attempt that failed before the sender was identified:
+/// any address on the internet can send a damaged or non-vaultsync first
+/// packet, so these are summed and reported at most every
+/// `UNIDENTIFIED_REPORT_EVERY`, naming the latest sender.
+fn unidentified(from: &IncomingAddr, e: &dyn std::fmt::Display) {
+    static SINCE_REPORT: Mutex<(Option<Instant>, u32)> = Mutex::new((None, 0));
+    let mut since = SINCE_REPORT.lock().unwrap();
+    since.1 += 1;
+    if since
+        .0
+        .is_some_and(|t| t.elapsed() < UNIDENTIFIED_REPORT_EVERY)
+    {
+        return;
+    }
+    let from = match from {
+        IncomingAddr::Ip(addr) => addr.to_string(),
+        IncomingAddr::Relay { url, endpoint_id } => {
+            format!("{} via relay {url}", endpoint_id.fmt_short())
+        }
+        other => format!("{other:?}"),
+    };
+    eprintln!(
+        "dropped {} connection attempt(s) that failed before identifying themselves; latest from {from}: {e:#}",
+        since.1
+    );
+    *since = (Some(Instant::now()), 0);
+}
+
+async fn answer(conn: Connection, vault: Vault, events: UnboundedSender<Event>) -> Result<()> {
     let peer = conn.remote_id();
     if crate::vault::hooked("stall-serving") {
         eprintln!("test hook: stall-serving");

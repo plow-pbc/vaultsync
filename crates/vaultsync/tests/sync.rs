@@ -58,6 +58,37 @@ fn non_member_is_refused() {
 }
 
 #[test]
+fn undecryptable_first_packets_are_summed_and_name_the_sender() {
+    let mut mesh = Mesh::new(1);
+    mesh.start(0);
+    let node = &mesh.nodes[0];
+    let addr = fs::read_to_string(mesh.addrs.join(&node.id)).unwrap();
+    let addr = addr.lines().next().unwrap();
+
+    // A QUIC v1 Initial whose payload is garbage, so it can't be decrypted.
+    let mut packet = vec![
+        0xc3, 0, 0, 0, 1, 8, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0x44, 0x9e,
+    ];
+    packet.resize(1200, 0xab);
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let sender = socket.local_addr().unwrap().to_string();
+    for _ in 0..3 {
+        socket.send_to(&packet, addr).unwrap();
+    }
+
+    let report = format!("latest from {sender}");
+    assert!(
+        wait_until(10, || node.log_text().contains(&report)),
+        "{}",
+        node.log_text()
+    );
+    std::thread::sleep(Duration::from_secs(1));
+    let log = node.log_text();
+    assert_eq!(log.matches("failed before identifying").count(), 1, "{log}");
+    assert!(!log.contains("request failed"), "{log}");
+}
+
+#[test]
 fn concurrent_offline_edits_merge_or_keep_both() {
     let mut mesh = Mesh::new(3);
     let lines: String = (1..=10).map(|i| format!("line {i}\n")).collect();
