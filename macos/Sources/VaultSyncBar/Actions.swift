@@ -25,14 +25,14 @@ enum Actions {
             NSWorkspace.shared.open(URL(fileURLWithPath: path))
             return
         }
+        // Nothing opens Obsidian while a folder is being added to it: the open
+        // would race the restart, and a second new folder would miss it.
+        guard !addingToObsidian else { return }
         // The App Store build can't reach Obsidian's settings.
         if Engine.sandboxed || ObsidianVaults.contains(folder) {
             NSWorkspace.shared.open(url)
             return
         }
-        // One at a time: a second open meanwhile would wait on the Obsidian
-        // the first restarts, and its folder would miss that launch.
-        guard !addingToObsidian else { return }
         addingToObsidian = true
         Task {
             defer { addingToObsidian = false }
