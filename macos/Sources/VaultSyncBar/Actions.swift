@@ -11,6 +11,8 @@ enum Actions {
         open(path: (vault.folder as NSString).appendingPathComponent(file), in: vault.folder)
     }
 
+    private static var addingToObsidian = false
+
     /// Obsidian opens a path by URL only inside a folder it knows as a vault,
     /// from the list it reads as it starts and rewrites as it quits. A folder
     /// it doesn't know yet is added there with Obsidian closed, then opened.
@@ -28,7 +30,12 @@ enum Actions {
             NSWorkspace.shared.open(url)
             return
         }
+        // One at a time: a second open meanwhile would wait on the Obsidian
+        // the first restarts, and its folder would miss that launch.
+        guard !addingToObsidian else { return }
+        addingToObsidian = true
         Task {
+            defer { addingToObsidian = false }
             for app in NSRunningApplication.runningApplications(withBundleIdentifier: "md.obsidian") {
                 app.terminate()
                 let asked = Date()
