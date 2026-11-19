@@ -340,14 +340,19 @@ fn edit_becomes_commit_within_seconds() {
 }
 
 #[test]
-fn a_vault_moved_inside_another_stays_out_of_its_history() {
+fn a_vault_inside_another_stays_out_of_its_history() {
     let tmp = tempfile::tempdir().unwrap();
     let outer = tmp.path().join("wiki");
+    // A folder the outer vault tracks becomes a vault, and another moves in.
+    fs::create_dir_all(outer.join("old")).unwrap();
+    fs::write(outer.join("old/note.md"), "before\n").unwrap();
     init(&outer);
-    let inner = tmp.path().join("company");
-    init(&inner);
-    fs::write(inner.join("runbook.md"), "company\n").unwrap();
-    fs::rename(&inner, outer.join("plowco")).unwrap();
+    init(&outer.join("old"));
+    let moved = tmp.path().join("company");
+    init(&moved);
+    fs::write(moved.join("runbook.md"), "company\n").unwrap();
+    fs::rename(&moved, outer.join("plowco")).unwrap();
+    fs::write(outer.join("old/note.md"), "after\n").unwrap();
     fs::write(outer.join("mine.md"), "mine\n").unwrap();
 
     let mut daemon = start_daemon(&outer, &[], "");
@@ -365,11 +370,12 @@ fn a_vault_moved_inside_another_stays_out_of_its_history() {
         Path::new("."),
         &[&gd, "ls-tree", "-r", "--name-only", "HEAD"],
     );
-    assert!(files.contains("mine.md"), "{files}");
-    assert!(
-        !files.contains("plowco"),
-        "the inner vault was committed: {files}"
+    assert_eq!(
+        files, "mine.md\nold/note.md\n",
+        "an inner vault was committed"
     );
+    let note = git(Path::new("."), &[&gd, "show", "HEAD:old/note.md"]);
+    assert_eq!(note, "before\n", "an inner vault's edit was committed");
     let status = ok(&outer, &["status"]);
     assert!(status.contains("0 uncommitted"), "{status}");
 }

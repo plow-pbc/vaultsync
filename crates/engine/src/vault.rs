@@ -634,7 +634,7 @@ impl Vault {
         let mut skip_others =
             |path: &Path, _: &[u8]| i32::from(self.not_ours(path.as_os_str().as_bytes()));
         index.add_all(["*"], IndexAddOption::DEFAULT, Some(&mut skip_others))?;
-        index.update_all(["*"], None)?;
+        index.update_all(["*"], Some(&mut skip_others))?;
         if entries(&index) != before {
             index.write()?;
         }
