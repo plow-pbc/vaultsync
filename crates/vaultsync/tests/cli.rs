@@ -340,6 +340,41 @@ fn edit_becomes_commit_within_seconds() {
 }
 
 #[test]
+fn a_vault_moved_inside_another_stays_out_of_its_history() {
+    let tmp = tempfile::tempdir().unwrap();
+    let outer = tmp.path().join("wiki");
+    init(&outer);
+    let inner = tmp.path().join("company");
+    init(&inner);
+    fs::write(inner.join("runbook.md"), "company\n").unwrap();
+    fs::rename(&inner, outer.join("plowco")).unwrap();
+    fs::write(outer.join("mine.md"), "mine\n").unwrap();
+
+    let mut daemon = start_daemon(&outer, &[], "");
+    let start = Instant::now();
+    while !ok(&outer, &["log", "-n", "1"]).contains("mine.md")
+        && start.elapsed() < Duration::from_secs(10)
+    {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+
+    let gd = format!("--git-dir={}", history_dir(&outer).display());
+    let files = git(
+        Path::new("."),
+        &[&gd, "ls-tree", "-r", "--name-only", "HEAD"],
+    );
+    assert!(files.contains("mine.md"), "{files}");
+    assert!(
+        !files.contains("plowco"),
+        "the inner vault was committed: {files}"
+    );
+    let status = ok(&outer, &["status"]);
+    assert!(status.contains("0 uncommitted"), "{status}");
+}
+
+#[test]
 fn rollback_of_several_paths_is_one_commit_or_none() {
     let tmp = tempfile::tempdir().unwrap();
     let folder = tmp.path().join("notes");

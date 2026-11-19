@@ -610,18 +610,30 @@ impl Vault {
         short(repo, id)
     }
 
+    /// Whether a vault-relative path is this vault's history, or a vault
+    /// moved inside this one, or in it: those files, history and key are the
+    /// inner vault's, and must never sync to this vault's members.
+    fn not_ours(&self, path: &[u8]) -> bool {
+        in_history(path)
+            || Path::new(std::ffi::OsStr::from_bytes(path))
+                .ancestors()
+                .any(|dir| {
+                    !dir.as_os_str().is_empty() && git_dir_for(&self.folder.join(dir)).is_dir()
+                })
+    }
+
     /// `git add -A`: the index takes every change in the folder, ignored
-    /// files aside, and never the history, whatever a synced `.gitignore`
-    /// says: it holds this machine's key. Written only when that changed it:
+    /// files and nested vaults aside, and never the history, whatever a synced
+    /// `.gitignore` says: it holds this machine's key. Written only when that changed it:
     /// a process stopped mid-write leaves the index locked.
     fn stage_all(&self, repo: &Repository) -> Result<Index> {
         let mut index = repo.index()?;
         let entries =
             |index: &Index| -> Vec<_> { index.iter().map(|e| (e.path, e.id, e.mode)).collect() };
         let before = entries(&index);
-        let mut skip_history =
-            |path: &Path, _: &[u8]| i32::from(in_history(path.as_os_str().as_bytes()));
-        index.add_all(["*"], IndexAddOption::DEFAULT, Some(&mut skip_history))?;
+        let mut skip_others =
+            |path: &Path, _: &[u8]| i32::from(self.not_ours(path.as_os_str().as_bytes()));
+        index.add_all(["*"], IndexAddOption::DEFAULT, Some(&mut skip_others))?;
         index.update_all(["*"], None)?;
         if entries(&index) != before {
             index.write()?;
@@ -661,7 +673,7 @@ impl Vault {
         let statuses = repo.statuses(Some(&mut opts))?;
         Ok(statuses
             .iter()
-            .filter(|s| !in_history(s.path_bytes()))
+            .filter(|s| !self.not_ours(s.path_bytes()))
             .count())
     }
 
