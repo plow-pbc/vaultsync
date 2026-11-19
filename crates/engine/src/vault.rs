@@ -973,9 +973,14 @@ impl Vault {
         }
         // A tracked file deleted since the checkpoint isn't in the checkout's
         // way and would be written back, so a rename made meanwhile would
-        // leave both names. Any tracked change since then: commit it and
+        // leave both names. Any tracked change since then, a vault inside
+        // this one aside: commit it and
         // merge again.
-        if !self.changed_files(repo)?.is_empty() {
+        if self
+            .changed_files(repo)?
+            .iter()
+            .any(|f| !self.not_ours(f.as_bytes()))
+        {
             return Ok(false);
         }
         if writes_into_history(&repo.find_commit(new)?.tree()?) {

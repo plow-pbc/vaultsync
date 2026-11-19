@@ -934,3 +934,31 @@ fn a_commit_that_would_write_into_the_history_is_refused() {
     assert!(!a.folder.join(".VaultSync/marker").exists());
     assert!(!history_dir(&a.folder).join("marker").exists());
 }
+
+#[test]
+fn edits_in_a_vault_inside_another_do_not_block_its_incoming_syncs() {
+    let mut mesh = Mesh::new(2);
+    mesh.start_all();
+    mesh.nodes[0].write("old/note.md", "before\n");
+    assert!(
+        wait_until(20, || mesh.nodes[1].read("old/note.md").is_some()),
+        "{}",
+        mesh.logs()
+    );
+    mesh.converged(20);
+    // m0's tracked folder becomes a vault of its own, and is edited there.
+    let old = mesh.nodes[0].folder.join("old");
+    ok(&mesh.nodes[0].folder, &["init", old.to_str().unwrap()]);
+    mesh.nodes[0].write("old/note.md", "after\n");
+    mesh.nodes[1].write("other.md", "from m1\n");
+    assert!(
+        wait_until(20, || mesh.nodes[0].read("other.md").as_deref()
+            == Some("from m1\n")),
+        "{}",
+        mesh.logs()
+    );
+    assert_eq!(
+        mesh.nodes[1].read("old/note.md").as_deref(),
+        Some("before\n")
+    );
+}
