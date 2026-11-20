@@ -35,7 +35,7 @@ Description:
 > • End-to-end encrypted: only your machines hold the keys.
 > • Peer to peer: your Macs sync with each other directly. When they can't
 >   reach each other, a relay passes along encrypted data it can't read.
-> • No cloud copy: your notes and keys never touch a Plow server.
+> • No cloud copy, and Plow never sees your notes or keys.
 >
 > Simple to set up
 > Choose your wiki folder, then invite another Mac with a one-time link.
