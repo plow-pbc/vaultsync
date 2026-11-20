@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 
 @MainActor
 enum Actions {
@@ -54,6 +55,11 @@ enum Actions {
             }
             NSWorkspace.shared.open(url)
         }
+    }
+
+    /// Opening at login is the user's choice, from the welcome or the menu.
+    static func openAtLogin(_ on: Bool) {
+        try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()
     }
 
     /// Copies a one-time plow.co/sync link another machine joins with.

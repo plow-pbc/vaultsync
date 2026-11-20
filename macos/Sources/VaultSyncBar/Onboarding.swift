@@ -50,8 +50,12 @@ final class Onboarding: NSObject, NSWindowDelegate, WKScriptMessageHandler, WKNa
     }
 
     func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard message.body as? String == "chooseFolder" else { return }
-        Actions.addFolder { [window] in window.close() }
+        switch message.body as? String {
+        case "chooseFolder": Actions.addFolder { [window] in window.close() }
+        case "openAtLogin": Actions.openAtLogin(true)
+        case "dontOpenAtLogin": Actions.openAtLogin(false)
+        default: break
+        }
     }
 
     /// The window shows only its own page: anything else, such as a link

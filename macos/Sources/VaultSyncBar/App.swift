@@ -30,19 +30,10 @@ struct VaultSyncBarApp: App {
     }
 }
 
-/// Starts the engine with the app, shows the welcome on first launch, and
-/// opens at login unless the user turned that off.
+/// Starts the engine with the app, and shows the welcome on first launch.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         MainActor.assumeIsolated { Onboarding.showOnFirstLaunch() }
-        if !UserDefaults.standard.bool(forKey: "loginItemChosen") {
-            do {
-                try SMAppService.mainApp.register()
-            } catch {
-                NSLog("VaultSync: couldn't open at login: \(error.localizedDescription)")
-            }
-            UserDefaults.standard.set(true, forKey: "loginItemChosen")
-        }
         NSLog("VaultSync: open at login: \(SMAppService.mainApp.status.rawValue)")
         MainActor.assumeIsolated { Engine.shared.start() }
     }
@@ -125,7 +116,7 @@ struct MenuContent: View {
         Divider()
         Toggle("Open at Login", isOn: Binding(
             get: { SMAppService.mainApp.status == .enabled },
-            set: { on in try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }
+            set: { Actions.openAtLogin($0) }
         ))
         Button("Quit") { NSApplication.shared.terminate(nil) }.keyboardShortcut("q")
     }
