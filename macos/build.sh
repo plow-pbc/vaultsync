@@ -38,10 +38,9 @@ for arch in arm64 x86_64; do
     set -- "$@" "$(swift build -c release --triple "$arch-apple-macosx14.0" --show-bin-path)/VaultSyncBar"
 done
 rm -rf build && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-# The Plow app icon and menu-bar mark, rendered from the plow repo's brand/;
-# menu-icon.swift adds the sync dot to the mark.
-cp -R Resources/AppIcon.icns Resources/MenuIcon.png Resources/MenuIcon@2x.png Resources/Onboarding \
-    Resources/PrivacyInfo.xcprivacy "$APP/Contents/Resources/"
+# The Plow app icon, and the menu-bar icon in its three states.
+cp -R Resources/AppIcon.icns Resources/MenuSynced*.png Resources/MenuSyncing*.png Resources/MenuNeedsYou*.png \
+    Resources/Onboarding Resources/PrivacyInfo.xcprivacy "$APP/Contents/Resources/"
 lipo -create -output "$APP/Contents/MacOS/VaultSync" "$@"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
