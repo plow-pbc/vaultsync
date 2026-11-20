@@ -17,6 +17,31 @@ altool finds `AuthKey_<ASC_KEY_ID>.p8` in `~/.appstoreconnect/private_keys` or
 `$API_PRIVATE_KEYS_DIR`. Each upload needs a higher version: `CFBundleVersion`
 is the workspace version in `Cargo.toml`.
 
+## Store listing
+
+- Name: WikiSync by Plow · Subtitle: Your wiki on every Mac
+- Category: Productivity · Price: free
+- Support URL: https://plow.co · Privacy policy: https://plow.co/privacy
+- Keywords: obsidian,sync,notes,wiki,markdown,peer to peer,encrypted,vault,p2p,private
+- Screenshots: the three welcome steps, 1280×800.
+
+Description:
+
+> WikiSync keeps a folder of notes, such as your Obsidian vault, the same on
+> every Mac you use. Edit a note on one machine and it's on the others moments
+> later.
+>
+> Private by design
+> • End-to-end encrypted: only your machines hold the keys.
+> • Peer to peer: your Macs sync with each other directly. When they can't
+>   reach each other, a relay passes along encrypted data it can't read.
+> • No cloud copy: your notes and keys never touch a Plow server.
+>
+> Simple to set up
+> Choose your wiki folder, then invite another Mac with a one-time link.
+> WikiSync lives in the menu bar, shows each machine and when it last synced,
+> and lists any conflicting edits for you to open.
+
 ## For App Review
 
 Entitlements (`macos/VaultSync.entitlements`), and why:
