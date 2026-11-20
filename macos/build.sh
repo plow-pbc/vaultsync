@@ -34,7 +34,7 @@ done
 rm -rf build && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # The Plow app icon and menu-bar mark, rendered from the plow repo's brand/;
 # menu-icon.swift adds the sync dot to the mark.
-cp Resources/AppIcon.icns Resources/MenuIcon.png Resources/MenuIcon@2x.png "$APP/Contents/Resources/"
+cp -R Resources/AppIcon.icns Resources/MenuIcon.png Resources/MenuIcon@2x.png Resources/Onboarding "$APP/Contents/Resources/"
 lipo -create -output "$APP/Contents/MacOS/VaultSync" "$@"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

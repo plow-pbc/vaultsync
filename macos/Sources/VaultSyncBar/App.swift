@@ -30,10 +30,11 @@ struct VaultSyncBarApp: App {
     }
 }
 
-/// Starts the engine with the app, and opens at login unless the user
-/// turned that off.
+/// Starts the engine with the app, shows the welcome on first launch, and
+/// opens at login unless the user turned that off.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
+        MainActor.assumeIsolated { Onboarding.showOnFirstLaunch() }
         if !UserDefaults.standard.bool(forKey: "loginItemChosen") {
             do {
                 try SMAppService.mainApp.register()

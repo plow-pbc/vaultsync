@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; font-src 'self'">
+<title>WikiSync by Plow</title>
+<!-- Look and welcome animation copied from Plow Latch's first-run screen
+     (latch apps/desktop/src/renderer/onboarding.css), trimmed to three steps. -->
+<style>
+@font-face {
+  font-family: "DM Sans";
+  font-weight: 300 700;
+  src: url("dm-sans-latin.woff2") format("woff2");
+}
+:root {
+  color-scheme: dark;
+  --midnight: #01000a;
+  --window: #111110;
+  --content: #0c0c0b;
+  --titlebar: #0e0e0d;
+  --surface-2: rgba(240, 240, 232, 0.085);
+  --border: rgba(240, 240, 232, 0.08);
+  --border-soft: rgba(240, 240, 232, 0.06);
+  --text: #f0f0e8;
+  --muted: rgba(240, 240, 232, 0.48);
+  --muted-2: rgba(240, 240, 232, 0.64);
+  --volt: #d5ef8a;
+  --volt-glow: rgba(213, 239, 138, 0.28);
+  --sage: #a6c2a6;
+  --sans: "DM Sans", system-ui, -apple-system, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { width: 100%; height: 100%; margin: 0; }
+body {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--window);
+  color: var(--text);
+  font: 13px var(--sans);
+  -webkit-font-smoothing: antialiased;
+  -webkit-user-select: none;
+  cursor: default;
+}
+button { font: inherit; }
+button:focus-visible { outline: 2px solid var(--volt); outline-offset: 3px; }
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+  opacity: 0.05;
+  mix-blend-mode: screen;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='180' height='180'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+.titlebar { flex: none; height: 28px; background: var(--titlebar); border-bottom: 1px solid var(--border); }
+main {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  padding: 40px 56px 24px;
+  background:
+    radial-gradient(620px 240px at 92% -24%, rgba(94, 122, 94, 0.16), transparent 70%),
+    radial-gradient(500px 240px at 0% 126%, rgba(196, 191, 255, 0.1), transparent 72%),
+    var(--content);
+}
+section { max-width: 480px; margin: 0 auto; animation: step-in 150ms ease both; }
+section[hidden] { display: none; }
+@keyframes step-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+h1 { margin: 0 0 18px; font-size: 34px; font-weight: 600; letter-spacing: -0.028em; line-height: 1.08; }
+.head-center { display: flex; flex-direction: column; align-items: center; text-align: center; }
+.subhead { max-width: 40ch; margin: 0; color: var(--muted-2); font-size: 15px; font-weight: 300; line-height: 1.62; }
+
+.welcome { position: relative; display: flex; flex-direction: column; align-items: center; padding-top: 10px; text-align: center; }
+.welcome-glow {
+  position: absolute; z-index: 0; top: 110px; left: 50%;
+  width: 420px; height: 420px; border-radius: 50%;
+  opacity: 0; transform: translate(-50%, -50%) scale(0.86);
+  background: radial-gradient(circle, rgba(213, 239, 138, 0.14) 0%, rgba(213, 239, 138, 0.06) 30%, rgba(213, 239, 138, 0.02) 52%, transparent 72%);
+  filter: blur(64px);
+  pointer-events: none;
+}
+.welcome-logo {
+  position: relative; z-index: 1;
+  height: 200px; margin-bottom: 44px;
+  color: var(--volt);
+  transform: scale(0.965);
+  --glow-a: 0.22; --glow-b: 0.16; --glow-c: 0.12;
+  filter:
+    drop-shadow(0 0 5px rgba(213, 239, 138, var(--glow-a)))
+    drop-shadow(0 0 18px rgba(213, 239, 138, var(--glow-b)))
+    drop-shadow(0 10px 34px rgba(213, 239, 138, var(--glow-c)));
+}
+.welcome-logo svg { display: block; height: 200px; overflow: visible; }
+.plw-mark {
+  fill: currentcolor; fill-opacity: 0;
+  stroke: var(--volt); stroke-width: 1.4; stroke-linecap: round; stroke-linejoin: round;
+  stroke-dasharray: var(--plw-len, 4000); stroke-dashoffset: var(--plw-len, 4000); stroke-opacity: 0.95;
+}
+.plw-sheen { opacity: 0; }
+.welcome-eyebrow {
+  position: relative; z-index: 1; margin: 0 auto 12px;
+  opacity: 0; transform: translateY(14px);
+  color: var(--muted); font: 500 10.5px var(--sans); letter-spacing: 0.22em; text-transform: uppercase;
+}
+.welcome h1, .welcome .subhead { position: relative; z-index: 1; opacity: 0; transform: translateY(14px); }
+.welcome h1 { margin-bottom: 16px; }
+
+.entering .plw-mark {
+  animation:
+    plw-draw 950ms cubic-bezier(0.66, 0, 0.2, 1) 50ms both,
+    plw-fill 550ms cubic-bezier(0.3, 0.6, 0.25, 1) 820ms both,
+    plw-stroke 550ms cubic-bezier(0.4, 0, 0.3, 1) 900ms both;
+}
+.entering .welcome-logo {
+  animation:
+    logo-scale 950ms cubic-bezier(0.2, 0.7, 0.2, 1) 50ms both,
+    glow-ride 1.7s cubic-bezier(0.3, 0.5, 0.2, 1) 50ms both;
+}
+.entering .plw-sheen { animation: plw-sheen 620ms cubic-bezier(0.4, 0, 0.25, 1) 1.14s both; }
+.entering .welcome-glow {
+  animation:
+    glow-settle 1.7s cubic-bezier(0.25, 0.6, 0.2, 1) 50ms both,
+    glow-breathe 6s ease-in-out 1.75s infinite;
+}
+.entering .welcome-eyebrow { animation: reveal-up 600ms cubic-bezier(0.2, 0.7, 0.2, 1) 1.02s both; }
+.entering .welcome h1 { animation: reveal-up 600ms cubic-bezier(0.2, 0.7, 0.2, 1) 1.13s both; }
+.entering .welcome .subhead { animation: reveal-up 600ms cubic-bezier(0.2, 0.7, 0.2, 1) 1.25s both; }
+body.on-welcome .next { opacity: 0; }
+body.on-welcome.entering .next { animation: reveal-up 600ms cubic-bezier(0.2, 0.7, 0.2, 1) 1.48s both; }
+
+@keyframes plw-draw {
+  from { stroke-dashoffset: var(--plw-len, 4000); stroke-opacity: 0.95; }
+  to { stroke-dashoffset: 0; stroke-opacity: 0.95; }
+}
+@keyframes plw-fill { from { fill-opacity: 0; } to { fill-opacity: 1; } }
+@keyframes plw-stroke {
+  0% { stroke-width: 1.4; stroke-opacity: 0.95; }
+  70% { stroke-width: 0.9; stroke-opacity: 0.35; }
+  100% { stroke-width: 0; stroke-opacity: 0; }
+}
+@keyframes logo-scale { from { transform: scale(0.965); } to { transform: scale(1); } }
+@keyframes glow-ride {
+  0% { --glow-a: 0.3; --glow-b: 0.26; --glow-c: 0.14; }
+  45% { --glow-a: 0.42; --glow-b: 0.34; --glow-c: 0.18; }
+  100% { --glow-a: 0.22; --glow-b: 0.16; --glow-c: 0.12; }
+}
+@keyframes plw-sheen {
+  from { opacity: 1; transform: translateX(0); }
+  99% { opacity: 1; }
+  to { opacity: 0; transform: translateX(820px); }
+}
+@keyframes reveal-up { from { opacity: 0; transform: translateY(14px); } to { opacity: 1; transform: none; } }
+@keyframes glow-settle {
+  0% { opacity: 0; transform: translate(-50%, -50%) scale(0.86); }
+  40% { opacity: 0.92; transform: translate(-50%, -50%) scale(1.06); }
+  100% { opacity: 0.7; transform: translate(-50%, -50%) scale(1); }
+}
+@keyframes glow-breathe {
+  0%, 100% { opacity: 0.7; transform: translate(-50%, -50%) scale(1); }
+  50% { opacity: 0.82; transform: translate(-50%, -50%) scale(1.05); }
+}
+
+.trust-rows { display: flex; flex-direction: column; margin-top: 26px; }
+.trust-row { display: flex; gap: 16px; align-items: flex-start; padding: 17px 2px; border-top: 1px solid var(--border-soft); }
+.trust-row:first-child { border-top: 0; }
+.trust-icon {
+  flex: none; display: grid; width: 40px; height: 40px; place-items: center;
+  border-radius: 11px; background: var(--surface-2); color: var(--sage);
+}
+.trust-icon svg { width: 20px; height: 20px; fill: none; stroke: currentcolor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.trust-title { margin-bottom: 6px; font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
+.trust-detail { color: var(--muted-2); font-size: 13.5px; font-weight: 300; line-height: 1.5; }
+.folder-art { margin: 6px 0 30px; color: var(--sage); }
+.folder-art svg { width: 64px; height: 64px; fill: none; stroke: currentcolor; stroke-width: 1.2; stroke-linejoin: round; }
+
+footer {
+  position: relative; z-index: 3; flex: none;
+  display: flex; align-items: center; justify-content: space-between;
+  min-height: 76px; padding: 18px 32px;
+  border-top: 1px solid var(--border); background: var(--titlebar);
+}
+.back {
+  padding: 8px 10px; border: 0; border-radius: 8px; background: transparent;
+  color: var(--muted-2); font-size: 13.5px; font-weight: 600; cursor: pointer;
+}
+.back:hover { color: var(--text); }
+.back[hidden] { display: inline-block; visibility: hidden; }
+.dots { position: absolute; top: 50%; left: 50%; display: flex; gap: 6px; transform: translate(-50%, -50%); }
+.dots i { width: 6px; height: 6px; border-radius: 50%; background: rgba(240, 240, 232, 0.18); transition: background 200ms, transform 200ms, box-shadow 200ms; }
+.dots i.active { transform: scale(1.15); background: var(--volt); box-shadow: 0 0 8px var(--volt-glow); }
+.dots i.complete { background: var(--sage); }
+.next {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 13px 26px; border: 1px solid var(--volt); border-radius: 11px;
+  background: var(--volt); box-shadow: 0 8px 26px -10px var(--volt-glow);
+  color: var(--midnight); font-size: 14.5px; font-weight: 700; cursor: pointer;
+}
+.next:hover { filter: brightness(1.06); }
+.next:active { transform: translateY(0.5px); }
+
+@media (prefers-reduced-motion: reduce) {
+  section, .entering .welcome-logo, .entering .plw-mark, .entering .plw-sheen, .entering .welcome-glow,
+  .entering .welcome-eyebrow, .entering .welcome h1, .entering .welcome .subhead, body.on-welcome.entering .next {
+    animation: none !important;
+  }
+  .plw-mark { fill-opacity: 1; stroke-width: 0; }
+  .welcome-logo { transform: none; }
+  .welcome-glow { opacity: 0.7; transform: translate(-50%, -50%); }
+  .welcome-eyebrow, .welcome h1, .welcome .subhead, body.on-welcome .next { opacity: 1; transform: none; }
+}
+</style>
+</head>
+<body class="on-welcome">
+<div class="titlebar"></div>
+<main>
+  <section id="welcome" class="welcome">
+    <div class="welcome-glow" aria-hidden="true"></div>
+    <div class="welcome-logo">
+      <svg viewBox="0 0 400 400" role="img" aria-label="Plow">
+        <defs>
+          <linearGradient id="sheen" x1="0" y1="0" x2="1" y2="0.35">
+            <stop offset="0%" stop-color="#fff" stop-opacity="0"/>
+            <stop offset="42%" stop-color="#fff" stop-opacity="0"/>
+            <stop offset="50%" stop-color="#fff" stop-opacity="0.9"/>
+            <stop offset="58%" stop-color="#fff" stop-opacity="0"/>
+            <stop offset="100%" stop-color="#fff" stop-opacity="0"/>
+          </linearGradient>
+          <clipPath id="clip"><use href="#mark"/></clipPath>
+        </defs>
+        <path id="mark" class="plw-mark" fill-rule="evenodd" clip-rule="evenodd" d="M64.2891 6.03791C103.801 -2.33144 140.954 15.1702 152.051 56.9783L152.059 56.9705C163.194 98.9657 146.53 157.832 93.5537 167.899C82.3869 170.025 67.326 171.372 53.1455 170.259V396.001L4 395.954V84.8739C4.57639 47.1219 27.183 13.9013 64.2891 6.03791ZM135.946 194.909V332.057C136.211 340.271 142.121 344.787 149.122 346.5L149.13 346.492C150.843 346.912 153.701 347.192 155.469 347.192H164.098V395.945H153.709C120.777 396.934 91.746 371.249 87.1982 338.986C87.1671 338.41 87.1278 337.827 87.0889 337.251C86.5126 328.827 86.3027 320.379 86.3027 311.939V194.909H135.946ZM396.003 328.515C396.003 344.125 391.035 355.422 387.889 361.23C367.751 398.383 319.82 406.581 286.584 381.441C261.104 401.224 224.177 400.905 200.13 379.386C190.162 370.463 177.688 354.425 177.688 332.93V194.909H226.459C226.459 231.447 226.451 293.231 226.459 323.867C226.49 329.325 226.747 334.557 230.049 339.142C237.026 348.936 251.137 349.637 258.714 339.944C262.833 333.949 261.868 329.255 262.062 320.037V194.909H311.612C311.612 228.504 311.597 298.183 311.612 324.568C311.628 327.223 311.714 329.909 312.212 332.377C314.463 344.6 330.216 349.723 339.95 341.759C344.038 338.8 347.169 333.84 347.185 329.114C347.27 287.188 347.192 41.4011 347.216 4.06819H396.003V328.515ZM197.996 22.5194C236.8 -9.91499 297.01 1.78684 321.571 45.6815C340.884 78.9335 332.536 123.257 303.389 148.069H303.381L303.271 148.163C269 178.48 214.395 174.851 185.785 138.711C157.51 103.902 163.055 50.7341 197.996 22.5194ZM83.1182 51.6688C68.011 51.5365 58.6272 60.6846 54.7959 74.5428C53.6434 78.6847 53.1611 82.9903 53.1533 87.2957V123.249C61.1118 124.759 69.7794 125.507 77.0137 124.674V124.681C95.9831 122.782 107.617 107.662 107.695 85.7225C107.765 66.4379 98.8794 51.8011 83.1182 51.6688ZM284.582 95.1746C291.972 70.7904 269.958 46.6475 245.335 49.7459L245.202 49.7615C217.55 53.4598 202.98 88.5723 222.16 110.053C242.142 132.895 276.125 123.49 284.582 95.1746Z"/>
+        <g clip-path="url(#clip)"><rect class="plw-sheen" x="-400" y="0" width="400" height="400" fill="url(#sheen)"/></g>
+      </svg>
+    </div>
+    <p class="welcome-eyebrow">Plow presents</p>
+    <h1>WikiSync</h1>
+    <p class="subhead">Your wiki, the same on every Mac you use. Edit a note here and it's there.</p>
+  </section>
+
+  <section id="private" hidden>
+    <div class="head-center">
+      <h1>Private by design</h1>
+      <p class="subhead">Your notes go from your Mac to your other machines, and nowhere else.</p>
+    </div>
+    <div class="trust-rows">
+      <div class="trust-row">
+        <span class="trust-icon"><svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg></span>
+        <span><div class="trust-title">End-to-end encrypted</div>
+        <div class="trust-detail">Only your machines hold the keys.</div></span>
+      </div>
+      <div class="trust-row">
+        <span class="trust-icon"><svg viewBox="0 0 24 24"><rect x="2.5" y="5" width="8" height="6" rx="1.5"/><rect x="13.5" y="13" width="8" height="6" rx="1.5"/><path d="M6.5 11v5h7M17.5 13V8h-7"/></svg></span>
+        <span><div class="trust-title">Peer to peer</div>
+        <div class="trust-detail">Your Macs sync with each other directly. When they can't reach each other, a relay passes along encrypted data it can't read.</div></span>
+      </div>
+      <div class="trust-row">
+        <span class="trust-icon"><svg viewBox="0 0 24 24"><path d="M12 3l7 4v6c0 4-3 6.5-7 8-4-1.5-7-4-7-8V7z"/><path d="M9.2 12.4l1.9 1.9 3.7-4"/></svg></span>
+        <span><div class="trust-title">No server reads your files</div>
+        <div class="trust-detail">There's no cloud copy. Your notes and keys never touch a Plow server.</div></span>
+      </div>
+    </div>
+  </section>
+
+  <section id="folder" class="head-center" hidden>
+    <div class="folder-art"><svg viewBox="0 0 64 64"><path d="M6 16a4 4 0 0 1 4-4h14l6 6h24a4 4 0 0 1 4 4v26a4 4 0 0 1-4 4H10a4 4 0 0 1-4-4z"/><path d="M6 26h52"/></svg></div>
+    <h1>Choose your wiki</h1>
+    <p class="subhead">Pick the folder you keep your notes in, such as your Obsidian vault. WikiSync keeps it in sync from now on. To join a wiki another machine already syncs, use Join with a code in the menu bar.</p>
+  </section>
+</main>
+<footer>
+  <button class="back" type="button" hidden>Back</button>
+  <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+  <button class="next" type="button">Get started</button>
+</footer>
+<script>
+const steps = ["welcome", "private", "folder"];
+const labels = ["Get started", "Continue", "Choose a folder…"];
+const back = document.querySelector(".back");
+const next = document.querySelector(".next");
+let step = 0;
+
+function show(index) {
+  step = index;
+  steps.forEach((id, i) => { document.getElementById(id).hidden = i !== step; });
+  document.querySelectorAll(".dots i").forEach((dot, i) => {
+    dot.classList.toggle("active", i === step);
+    dot.classList.toggle("complete", i < step);
+  });
+  document.body.classList.toggle("on-welcome", step === 0);
+  back.hidden = step === 0;
+  next.textContent = labels[step];
+  next.focus({ preventScroll: true });
+}
+
+next.addEventListener("click", () => {
+  if (step < steps.length - 1) show(step + 1);
+  else window.webkit.messageHandlers.onboarding.postMessage("chooseFolder");
+});
+back.addEventListener("click", () => show(step - 1));
+
+show(0);
+// The stroke is drawn over its own length; the entrance starts once fonts and
+// a frame have painted, as in Latch.
+const mark = document.getElementById("mark");
+document.body.style.setProperty("--plw-len", Math.ceil(mark.getTotalLength()));
+Promise.race([document.fonts.ready, new Promise((done) => setTimeout(done, 800))])
+  .then(() => requestAnimationFrame(() => requestAnimationFrame(() => document.body.classList.add("entering"))));
+</script>
+</body>
+</html>
