@@ -40,12 +40,10 @@ the required-reason APIs the binary uses: UserDefaults (CA92.1), file
 timestamps in user-picked folders and the container (3B52.1, C617.1), and
 `mach_absolute_time` for elapsed time (35F9.1).
 
-## Open before submitting
+Open at login is opt-in (guideline 2.4.5(iii)): a checkbox on the welcome's
+last step, unchecked by default, and the menu's Open at Login toggle. The app
+never turns it on by itself.
 
-- Open at login: on first launch the app registers itself as a login item
-  without asking. Guideline 2.4.5(iii) forbids starting at login without the
-  user's consent, so this needs an opt-in (the menu already has the toggle).
-- Export compliance: sync uses standard TLS 1.3 over QUIC (iroh) and ed25519
-  keys. App Store Connect asks about encryption on each build until
-  `ITSAppUsesNonExemptEncryption` is set in `Info.plist`; that answer is Plow's
-  to give.
+Export compliance: `Info.plist` sets `ITSAppUsesNonExemptEncryption` to false.
+The app uses only standard encryption, TLS 1.3 over QUIC (iroh) and the
+operating system's cryptography, so App Store Connect doesn't ask on each build.
