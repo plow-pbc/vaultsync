@@ -7,42 +7,21 @@ import ServiceManagement
 struct VaultSyncBarApp: App {
     @NSApplicationDelegateAdaptor private var delegate: AppDelegate
     @State private var model = Model()
-    /// The Plow mark with its sync dot, as a template image macOS tints for
-    /// the menu bar.
-    private static let menuMark: NSImage? = {
-        let mark = NSImage(named: "MenuIcon")
-        mark?.isTemplate = true
-        return mark
-    }()
 
     var body: some Scene {
         MenuBarExtra {
             MenuContent(model: model)
         } label: {
-            if model.healthy, let mark = Self.menuMark {
-                Image(nsImage: mark).accessibilityLabel("WikiSync by Plow")
-            } else {
-                Image(systemName: "exclamationmark.arrow.triangle.2.circlepath")
-                    .accessibilityLabel("WikiSync by Plow needs attention")
-            }
+            Image(nsImage: model.state.icon).accessibilityLabel(model.state.label)
         }
         .menuBarExtraStyle(.menu)
     }
 }
 
-/// Starts the engine with the app, shows the welcome on first launch, and
-/// opens at login unless the user turned that off.
+/// Starts the engine with the app, and shows the welcome on first launch.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         MainActor.assumeIsolated { Onboarding.showOnFirstLaunch() }
-        if !UserDefaults.standard.bool(forKey: "loginItemChosen") {
-            do {
-                try SMAppService.mainApp.register()
-            } catch {
-                NSLog("VaultSync: couldn't open at login: \(error.localizedDescription)")
-            }
-            UserDefaults.standard.set(true, forKey: "loginItemChosen")
-        }
         NSLog("VaultSync: open at login: \(SMAppService.mainApp.status.rawValue)")
         MainActor.assumeIsolated { Engine.shared.start() }
     }
@@ -82,10 +61,33 @@ final class Model {
         }
     }
 
-    /// Filled when every folder is in sync, an exclamation mark otherwise.
-    var healthy: Bool {
-        problem == nil && vaults.allSatisfy {
-            $0.error == nil && $0.running == true && ($0.conflicts ?? []).isEmpty && ($0.pending ?? 0) == 0
+    /// What the menu-bar icon shows, from what the menu lists: a problem, an
+    /// unreadable or stopped folder, or a conflict needs the user; a folder
+    /// saving changes or still starting is syncing.
+    var state: SyncState {
+        if problem != nil || vaults.contains(where: {
+            $0.error != nil || !($0.conflicts ?? []).isEmpty || ($0.running != true && $0.started != false)
+        }) { return .needsYou }
+        if vaults.contains(where: { $0.running != true || ($0.pending ?? 0) > 0 }) { return .syncing }
+        return .synced
+    }
+}
+
+/// The menu-bar icons, template images macOS tints for the bar.
+enum SyncState: String {
+    case synced = "MenuSynced", syncing = "MenuSyncing", needsYou = "MenuNeedsYou"
+
+    var icon: NSImage {
+        let image = NSImage(named: rawValue)!
+        image.isTemplate = true
+        return image
+    }
+
+    var label: String {
+        switch self {
+        case .synced: "WikiSync by Plow"
+        case .syncing: "WikiSync by Plow, syncing"
+        case .needsYou: "WikiSync by Plow needs attention"
         }
     }
 }
@@ -125,7 +127,7 @@ struct MenuContent: View {
         Divider()
         Toggle("Open at Login", isOn: Binding(
             get: { SMAppService.mainApp.status == .enabled },
-            set: { on in try? on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister() }
+            set: { Actions.openAtLogin($0) }
         ))
         Button("Quit") { NSApplication.shared.terminate(nil) }.keyboardShortcut("q")
     }
