@@ -7,7 +7,8 @@ import ServiceManagement
 struct VaultSyncBarApp: App {
     @NSApplicationDelegateAdaptor private var delegate: AppDelegate
     @State private var model = Model()
-    /// The Plow mark, as a template image macOS tints for the menu bar.
+    /// The Plow mark with its sync dot, as a template image macOS tints for
+    /// the menu bar.
     private static let menuMark: NSImage? = {
         let mark = NSImage(named: "MenuIcon")
         mark?.isTemplate = true
