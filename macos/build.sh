@@ -9,6 +9,11 @@
 #   SIGN=- build.sh               ad-hoc signed, not notarized (local testing)
 #   SANDBOX=1 build.sh            with the App Sandbox (the App Store build); without
 #                                 it the app shares the command-line tool's vaults
+#   APPSTORE=1 build.sh           sandboxed and signed for the Mac App Store, packed into
+#                                 build/WikiSync-by-Plow.pkg for upload; reads
+#       APPSTORE_IDENTITY      the app's signing identity ("Apple Distribution: …")
+#       INSTALLER_IDENTITY     the package's ("3rd Party Mac Developer Installer: …")
+#       PROVISIONING_PROFILE   path to the app's Mac App Store .provisionprofile
 #
 # The engine (crates/ffi) is linked in as a static library; build-engine.sh
 # makes it.
@@ -21,6 +26,7 @@ NOTARY_PROFILE=${NOTARY_PROFILE:-plow-notary}
 APP="build/WikiSync by Plow.app"
 ENTITLEMENTS=
 if [ "${SANDBOX:-0}" = 1 ]; then ENTITLEMENTS=VaultSync.entitlements; fi
+if [ "${APPSTORE:-0}" = 1 ]; then : "${APPSTORE_IDENTITY:?}" "${INSTALLER_IDENTITY:?}" "${PROVISIONING_PROFILE:?}"; fi
 DMG=build/WikiSync-by-Plow.dmg
 
 ./build-engine.sh
@@ -34,7 +40,8 @@ done
 rm -rf build && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 # The Plow app icon and menu-bar mark, rendered from the plow repo's brand/;
 # menu-icon.swift adds the sync dot to the mark.
-cp -R Resources/AppIcon.icns Resources/MenuIcon.png Resources/MenuIcon@2x.png Resources/Onboarding "$APP/Contents/Resources/"
+cp -R Resources/AppIcon.icns Resources/MenuIcon.png Resources/MenuIcon@2x.png Resources/Onboarding \
+    Resources/PrivacyInfo.xcprivacy "$APP/Contents/Resources/"
 lipo -create -output "$APP/Contents/MacOS/VaultSync" "$@"
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -55,6 +62,23 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+
+# The App Store wants the profile inside the app, and entitlements naming the
+# team and app the profile was issued for.
+if [ "${APPSTORE:-0}" = 1 ]; then
+    PROFILE=build/profile.plist
+    security cms -D -i "$PROVISIONING_PROFILE" > "$PROFILE"
+    TEAM=$(/usr/libexec/PlistBuddy -c "Print :TeamIdentifier:0" "$PROFILE")
+    cp "$PROVISIONING_PROFILE" "$APP/Contents/embedded.provisionprofile"
+    cp VaultSync.entitlements build/appstore.entitlements
+    /usr/libexec/PlistBuddy -c "Add :com.apple.application-identifier string $TEAM.co.plow.vaultsync" \
+        -c "Add :com.apple.developer.team-identifier string $TEAM" build/appstore.entitlements
+    codesign --force --sign "$APPSTORE_IDENTITY" --entitlements build/appstore.entitlements "$APP"
+    productbuild --component "$APP" /Applications --sign "$INSTALLER_IDENTITY" build/WikiSync-by-Plow.pkg
+    pkgutil --check-signature build/WikiSync-by-Plow.pkg
+    echo build/WikiSync-by-Plow.pkg
+    exit 0
+fi
 
 # The app beside an Applications link: open it, drag one onto the other.
 dmg() {
